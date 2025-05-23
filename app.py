@@ -1,12 +1,19 @@
 from flask import Flask, request
 import requests
 import os
+import google.generativeai as genai
 
 app = Flask(__name__)
 
+# Environment variables
 VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "pushupai_verify_token")
 ACCESS_TOKEN = os.environ.get("ACCESS_TOKEN", "")
 PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID", "")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+
+# Configure Gemini
+genai.configure(api_key=GEMINI_API_KEY)
+model = genai.GenerativeModel("gemini-pro")
 
 @app.route("/webhook", methods=["GET", "POST"])
 def webhook():
@@ -24,10 +31,19 @@ def webhook():
             msg = data["entry"][0]["changes"][0]["value"]["messages"][0]
             phone_number = msg["from"]
             user_text = msg["text"]["body"]
-            send_whatsapp_message(phone_number, f"👋 Hey! PushUpAI is live. You said: {user_text}")
+            gemini_reply = get_gemini_reply(user_text)
+            send_whatsapp_message(phone_number, gemini_reply)
         except Exception as e:
             print("Error handling message:", e)
         return "OK", 200
+
+def get_gemini_reply(prompt):
+    try:
+        response = model.generate_content(prompt)
+        return response.text.strip()
+    except Exception as e:
+        print("Gemini error:", e)
+        return "Sorry, I had trouble responding. Try again soon!"
 
 def send_whatsapp_message(phone_number, text):
     url = f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages"
