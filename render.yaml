@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: pushupai-webhook
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT
+    envVars:
+      - key: VERIFY_TOKEN
+        value: pushupai_verify_token
+      - key: ACCESS_TOKEN
+        value: YOUR_TEMP_ACCESS_TOKEN
+      - key: PHONE_NUMBER_ID
+        value: YOUR_PHONE_NUMBER_ID
