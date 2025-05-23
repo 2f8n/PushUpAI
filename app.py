@@ -13,7 +13,8 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 
 # Configure Gemini
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel("gemini-pro")
+model = genai.GenerativeModel("models/gemini-pro")
+
 
 @app.route("/webhook", methods=["GET", "POST"])
 def webhook():
