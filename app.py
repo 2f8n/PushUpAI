@@ -13,8 +13,6 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 
 # Configure Gemini
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel("models/gemini-pro")
-
 
 @app.route("/webhook", methods=["GET", "POST"])
 def webhook():
@@ -29,17 +27,22 @@ def webhook():
     if request.method == "POST":
         data = request.json
         try:
-            msg = data["entry"][0]["changes"][0]["value"]["messages"][0]
-            phone_number = msg["from"]
-            user_text = msg["text"]["body"]
-            gemini_reply = get_gemini_reply(user_text)
-            send_whatsapp_message(phone_number, gemini_reply)
+            value = data["entry"][0]["changes"][0]["value"]
+            if "messages" in value:
+                msg = value["messages"][0]
+                phone_number = msg["from"]
+                user_text = msg["text"]["body"]
+                gemini_reply = get_gemini_reply(user_text)
+                send_whatsapp_message(phone_number, gemini_reply)
+            else:
+                print("Webhook received non-message event.")
         except Exception as e:
             print("Error handling message:", e)
         return "OK", 200
 
 def get_gemini_reply(prompt):
     try:
+        model = genai.GenerativeModel(model_name="models/gemini-pro")
         response = model.generate_content(prompt)
         return response.text.strip()
     except Exception as e:
