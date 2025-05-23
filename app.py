@@ -37,13 +37,36 @@ def webhook():
             print("Error handling message:", e)
         return "OK", 200
 
-def get_gemini_reply(prompt):
+def get_gemini_reply(user_input):
     try:
+        model = genai.GenerativeModel("gemini-1.5-pro-latest")
+
+        # Workout intent detection
+        if any(word in user_input.lower() for word in ["workout", "exercise", "gym", "training", "routine"]):
+            prompt = f"""
+You are a professional fitness coach.
+
+Create a custom workout routine for the user based on this request:
+"{user_input}"
+
+Respond with:
+- Warm-up (in minutes)
+- Main workout (include exercises, sets, reps, and rest)
+- Cooldown/stretch
+- Optional tips for safety and consistency
+
+Assume user may not have a personal trainer. Be clear, motivating, and goal-focused.
+"""
+        else:
+            prompt = user_input  # fallback to freeform if it's not workout-related
+
         response = model.generate_content(prompt)
         return response.text.strip()
+
     except Exception as e:
         print("Gemini error:", e)
         return "Sorry, I had trouble responding. Try again soon!"
+
 
 def send_whatsapp_message(phone_number, text):
     url = f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages"
