@@ -2,6 +2,7 @@ from flask import Flask, request
 import requests
 import os
 import google.generativeai as genai
+from user_memory import get_user_profile, update_user_profile, add_message_to_history
 
 app = Flask(__name__)
 
@@ -13,7 +14,6 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 
 # Configure Gemini
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel("gemini-1.5-pro-latest")
 
 @app.route("/webhook", methods=["GET", "POST"])
 def webhook():
@@ -28,37 +28,81 @@ def webhook():
     if request.method == "POST":
         data = request.json
         try:
-            msg = data["entry"][0]["changes"][0]["value"]["messages"][0]
-            phone_number = msg["from"]
-            user_text = msg["text"]["body"]
-            gemini_reply = get_gemini_reply(user_text)
-            send_whatsapp_message(phone_number, gemini_reply)
+            value = data["entry"][0]["changes"][0]["value"]
+            if "messages" in value:
+                msg = value["messages"][0]
+                phone_number = msg["from"]
+                user_text = msg["text"]["body"]
+                add_message_to_history(phone_number, user_text)
+
+                user_profile = get_user_profile(phone_number)
+                user_name = user_profile.get("name")
+
+                # Ask for name if not saved yet
+                if not user_name:
+                    if any(word in user_text.lower() for word in ["i am", "my name is", "this is", "call me"]):
+                        name_guess = user_text.strip().split()[-1]
+                        update_user_profile(phone_number, "name", name_guess)
+                        reply = f"Thanks, {name_guess}! Now I can personalize your workouts and meals."
+                    else:
+                        reply = "Hey there! Before we get started, can I know your full name?"
+                else:
+                    reply = get_gemini_reply(user_text, user_name)
+
+                send_whatsapp_message(phone_number, reply)
+            else:
+                print("Webhook received non-message event.")
         except Exception as e:
             print("Error handling message:", e)
         return "OK", 200
 
-def get_gemini_reply(user_input):
+def get_gemini_reply(user_input, name):
     try:
         model = genai.GenerativeModel("gemini-1.5-pro-latest")
+        lower_input = user_input.lower()
 
-        # Workout intent detection
-        if any(word in user_input.lower() for word in ["workout", "exercise", "gym", "training", "routine"]):
+        if any(word in lower_input for word in ["workout", "exercise", "gym", "training", "routine"]):
             prompt = f"""
-You are a professional fitness coach.
+You are a personal fitness coach. The user’s name is {name}.
 
-Create a custom workout routine for the user based on this request:
+Create a custom workout routine for:
 "{user_input}"
 
-Respond with:
-- Warm-up (in minutes)
-- Main workout (include exercises, sets, reps, and rest)
-- Cooldown/stretch
-- Optional tips for safety and consistency
+Include:
+- Warm-up
+- Main workout with reps and sets
+- Cooldown
+- Motivational line for {name}
+"""
+        elif any(word in lower_input for word in ["meal", "diet", "food", "eat", "calorie", "breakfast", "lunch", "dinner", "recipe"]):
+            prompt = f"""
+You are a certified nutritionist. The user’s name is {name}.
 
-Assume user may not have a personal trainer. Be clear, motivating, and goal-focused.
+Create a daily meal plan for this request:
+"{user_input}"
+
+Include:
+- Meals with calorie estimates
+- Any tips personalized for {name}
+"""
+        elif "water" in lower_input or "drink" in lower_input:
+            prompt = f"""
+You're a hydration expert.
+
+Give water intake reminders, suggestions and motivational tips for {name} based on:
+"{user_input}"
+"""
+        elif "check-in" in lower_input or "motivation" in lower_input or "daily reminder" in lower_input:
+            prompt = f"""
+You're a motivational wellness coach.
+
+Send a daily check-in message personalized for {name}. Include:
+- Inspirational quote
+- Friendly health reminder
+- 1 question to reflect on
 """
         else:
-            prompt = user_input  # fallback to freeform if it's not workout-related
+            prompt = f"The user's name is {name}. Respond to their message: {user_input}"
 
         response = model.generate_content(prompt)
         return response.text.strip()
@@ -66,7 +110,6 @@ Assume user may not have a personal trainer. Be clear, motivating, and goal-focu
     except Exception as e:
         print("Gemini error:", e)
         return "Sorry, I had trouble responding. Try again soon!"
-
 
 def send_whatsapp_message(phone_number, text):
     url = f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages"
