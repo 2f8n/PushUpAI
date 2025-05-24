@@ -56,54 +56,27 @@ def webhook():
             print("Error handling message:", e)
         return "OK", 200
 
-def get_gemini_reply(user_input, name):
+def get_gemini_reply(user_input, name="Student"):
     try:
         model = genai.GenerativeModel("gemini-1.5-pro-latest")
-        lower_input = user_input.lower()
 
-        if any(word in lower_input for word in ["workout", "exercise", "gym", "training", "routine"]):
-            prompt = f"""
-You are a personal fitness coach. The user’s name is {name}.
+        prompt = f"""
+You are StudyMate AI — a friendly academic tutor on WhatsApp.
 
-Create a custom workout routine for:
-"{user_input}"
+🎓 Your job is to:
+- Explain clearly
+- Break down difficult ideas into steps
+- Stay positive and supportive
+- End every response with a check: "Did that make sense? ✅ Yes / ❓ Not yet?"
 
-Include:
-- Warm-up
-- Main workout with reps and sets
-- Cooldown
-- Motivational line for {name}
+👤 Student Name: {name}
+📩 Question: "{user_input}"
+
+Your response format should be:
+- Clear step-by-step explanation
+- Example if helpful
+- End with: “Did that make sense? ✅ Yes / ❓ Not yet?”
 """
-        elif any(word in lower_input for word in ["meal", "diet", "food", "eat", "calorie", "breakfast", "lunch", "dinner", "recipe"]):
-            prompt = f"""
-You are a certified nutritionist. The user’s name is {name}.
-
-Create a daily meal plan for this request:
-"{user_input}"
-
-Include:
-- Meals with calorie estimates
-- Any tips personalized for {name}
-"""
-        elif "water" in lower_input or "drink" in lower_input:
-            prompt = f"""
-You're a hydration expert.
-
-Give water intake reminders, suggestions and motivational tips for {name} based on:
-"{user_input}"
-"""
-        elif "check-in" in lower_input or "motivation" in lower_input or "daily reminder" in lower_input:
-            prompt = f"""
-You're a motivational wellness coach.
-
-Send a daily check-in message personalized for {name}. Include:
-- Inspirational quote
-- Friendly health reminder
-- 1 question to reflect on
-"""
-        else:
-            prompt = f"The user's name is {name}. Respond to their message: {user_input}"
-
         response = model.generate_content(prompt)
         return response.text.strip()
 
