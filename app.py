@@ -10,17 +10,17 @@ from requests.exceptions import HTTPError
 
 app = Flask(__name__)
 
-# ─── Configuration ────────────────────────────────────────────────────────
+# ─── Configuration ─────────────────────────────────────────────────────
 VERIFY_TOKEN    = os.getenv("VERIFY_TOKEN", "your_verify_token")
 ACCESS_TOKEN    = os.getenv("ACCESS_TOKEN", "")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID", "")
 GEMINI_API_KEY  = os.getenv("GEMINI_API_KEY", "")
 MODEL_NAME      = "gemini-1.5-pro-002"  # adjust as needed
 
-# ─── Initialize Gemini ───────────────────────────────────────────────────
+# ─── Initialize Gemini ──────────────────────────────────────────────────
 genai.configure(api_key=GEMINI_API_KEY)
 
-# ─── State & Memory ───────────────────────────────────────────────────────
+# ─── In-memory state & on-disk per-user memory ────────────────────────────
 user_states = {}
 def memory_path(phone): return f"memory/{phone}.json"
 
@@ -35,7 +35,7 @@ def save_user_memory(phone, data):
     with open(memory_path(phone), "w") as f:
         json.dump(data, f)
 
-# ─── Media Helpers ───────────────────────────────────────────────────────
+# ─── Media download helpers ─────────────────────────────────────────────
 def get_media_url(media_id):
     url = f"https://graph.facebook.com/v19.0/{media_id}"
     headers = {"Authorization": f"Bearer {ACCESS_TOKEN}"}
@@ -52,7 +52,7 @@ def download_media(url, dest):
         f.write(r.content)
     return dest
 
-# ─── Parsers ──────────────────────────────────────────────────────────────
+# ─── Parsers for PDF & image ────────────────────────────────────────────
 def parse_pdf(path):
     texts = []
     with pdfplumber.open(path) as pdf:
@@ -63,7 +63,7 @@ def parse_pdf(path):
 def parse_image(path):
     return pytesseract.image_to_string(Image.open(path))
 
-# ─── WhatsApp Senders ────────────────────────────────────────────────────
+# ─── WhatsApp senders ───────────────────────────────────────────────────
 def send_text(phone, text):
     payload = {
         "messaging_product":"whatsapp","to":phone,
@@ -77,8 +77,11 @@ def send_text(phone, text):
     )
     print("→ text", r.status_code, r.text)
 
+def slugify(s):
+    return "".join(c for c in s.lower() if c.isalnum() or c==" ").replace(" ","_")
+
 def send_buttons(phone, text, options=None):
-    """If options is None, fall back to Understood/Explain more."""
+    # Build buttons (default: Understood / Explain more)
     if not options:
         buttons = [
             {"type":"reply","reply":{"id":"understood","title":"Understood"}},
@@ -87,10 +90,16 @@ def send_buttons(phone, text, options=None):
     else:
         buttons = []
         for opt in options[:3]:
+            # truncate title to 20 chars
+            title = opt if len(opt)<=20 else opt[:17]+"..."
+            bid   = slugify(title)
             buttons.append({
                 "type":"reply",
-                "reply":{"id":opt.lower().replace(" ","_"),"title":opt}
+                "reply":{"id":bid,"title":title}
             })
+            # remember mapping
+            user_states[phone].setdefault("last_buttons", {})[bid] = opt
+
     payload = {
         "messaging_product":"whatsapp","to":phone,
         "type":"interactive",
@@ -108,7 +117,7 @@ def send_buttons(phone, text, options=None):
     )
     print("→ buttons", r.status_code, r.text)
 
-# ─── Gemini Query ────────────────────────────────────────────────────────
+# ─── Gemini Q&A ─────────────────────────────────────────────────────────
 def get_gemini_reply(prompt, name):
     system = f"""
 You are StudyMate AI, a warm, enthusiastic tutor (founded by ByteWave Media; mention only if asked).
@@ -124,21 +133,21 @@ Always address the student by name ({name}).
         print("Gemini error:", e)
         return ""
 
-# ─── Subject Detection ────────────────────────────────────────────────────
+# ─── Broad-subject logic ─────────────────────────────────────────────────
 BROAD_SUBJECTS = {
     "chemistry","physics","biology","english","grammar",
     "math","history","coding","programming","literature"
 }
 
 def handle_broad_subject(phone, subject, name):
-    # Ask Gemini for 4 common subtopics
     prompt = f"List four common subtopics in {subject.title()} that students often ask about, comma-separated."
     resp = get_gemini_reply(prompt, name)
     topics = [t.strip().title() for t in resp.split(",") if t.strip()]
-    text = f"Great—what specifically in {subject.title()} would you like to focus on? For example: {', '.join(topics[:3])}."
+    text = (f"Oh, great! What specifically in {subject.title()} would you like to focus on? "
+            f"For example: {', '.join(topics[:3])}.")
     send_buttons(phone, text, topics[:3])
 
-# ─── Main Webhook ────────────────────────────────────────────────────────
+# ─── Main webhook ───────────────────────────────────────────────────────
 @app.route("/webhook", methods=["GET","POST"])
 def webhook():
     if request.method=="GET":
@@ -159,48 +168,60 @@ def webhook():
     memory = load_user_memory(phone)
     user_states.setdefault(phone, {})
 
-    # 1) Onboard for Name
+    # ─── 1) Onboarding: collect full name ───────────────────────────────
     if "name" not in memory:
         if len(text.split())>=2:
-            memory["name"]=text; save_user_memory(phone,memory)
-            send_text(phone, f"Nice to meet you, {text}! What topic should we tackle today?")
+            memory["name"] = text
+            save_user_memory(phone, memory)
+            send_text(phone, f"Got it—I'll call you {text}. What topic shall we tackle first?")
         else:
-            send_text(phone, "Welcome! What’s your full name (first & last)?")
+            send_text(phone, "Welcome! What should I call you? (full name please)")
         return "OK",200
 
     name = memory["name"]
 
-    # 2) Button Reply Handling
+    # ─── 2) Interactive button replies ──────────────────────────────────
     payload = None
     if mtype=="interactive" and "button_reply" in msg.get("interactive",{}):
         payload = msg["interactive"]["button_reply"]["id"]
+
     if payload:
-        last_q = user_states[phone].get("last_user_q","")
+        # Understood / explain_more
         if payload=="understood":
-            send_text(phone, "Great! What shall we study next?")
-        elif payload=="explain_more" and last_q:
-            more = get_gemini_reply("Please explain further: "+ last_q, name)
-            user_states[phone]["last_user_q"]=last_q
-            send_buttons(phone, more)
+            send_text(phone, "Awesome! What would you like to study next?")
+        elif payload=="explain_more":
+            last_q = user_states[phone].get("last_user_q","")
+            if last_q:
+                more = get_gemini_reply("Please explain further: "+ last_q, name)
+                user_states[phone]["last_user_q"] = last_q
+                send_buttons(phone, more)
+            else:
+                send_text(phone, "Could you remind me what we were discussing?")
+        # dynamic subtopic buttons
+        elif payload in user_states[phone].get("last_buttons", {}):
+            orig = user_states[phone]["last_buttons"][payload]
+            user_states[phone]["last_user_q"] = orig
+            resp = get_gemini_reply(orig, name)
+            send_buttons(phone, resp)
         else:
-            send_text(phone, "Could you remind me of your question?")
+            send_text(phone, "Sorry, I didn’t catch that—could you rephrase?")
         return "OK",200
 
-    # 3) File / Image Upload
+    # ─── 3) File / image uploads ────────────────────────────────────────
     if mtype in ("document","image"):
-        media = msg[mtype]; mid=media["id"]
+        media = msg[mtype]; mid = media["id"]
         try:
             url = get_media_url(mid)
             loc = download_media(url, f"uploads/{mid}")
             parsed = parse_pdf(loc) if mtype=="document" else parse_image(loc)
-            user_states[phone]["last_file_text"]=parsed
+            user_states[phone]["last_file_text"] = parsed
             send_text(phone, f"Got your {mtype}! Reply *summarize* or *quiz* when ready.")
         except HTTPError as he:
-            print("Media error:",he)
+            print("Media error:", he)
             send_text(phone, "Sorry, I couldn’t fetch that file—try again?")
         return "OK",200
 
-    # 4) Summarize / Quiz Commands
+    # ─── 4) Summarize & quiz commands ───────────────────────────────────
     cmd = text.lower()
     if cmd=="summarize":
         parsed = user_states[phone].get("last_file_text","")
@@ -208,7 +229,7 @@ def webhook():
             send_text(phone, "No file in memory—please upload one first.")
         else:
             summ = get_gemini_reply("Summarize:\n"+parsed, name)
-            user_states[phone]["last_user_q"]=summ
+            user_states[phone]["last_user_q"] = summ
             send_buttons(phone, summ)
         return "OK",200
 
@@ -218,16 +239,16 @@ def webhook():
             send_text(phone, "No file in memory—please upload one first.")
         else:
             quiz = get_gemini_reply("Create a 5-question quiz on:\n"+parsed, name)
-            user_states[phone]["last_user_q"]=quiz
+            user_states[phone]["last_user_q"] = quiz
             send_buttons(phone, quiz)
         return "OK",200
 
-    # 5) Broad Subject Detection
+    # ─── 5) Broad-subject detection ─────────────────────────────────────
     if text.lower() in BROAD_SUBJECTS:
         handle_broad_subject(phone, text.lower(), name)
         return "OK",200
 
-    # 6) Pure Q&A
+    # ─── 6) Pure Q&A fallback ─────────────────────────────────────────
     if not text:
         send_text(phone, "I didn’t catch any text—what would you like to study?")
         return "OK",200
@@ -240,5 +261,6 @@ def webhook():
         send_buttons(phone, answer)
     return "OK",200
 
+
 if __name__=="__main__":
-    app.run(host="0.0.0.0",port=10000)
+    app.run(host="0.0.0.0", port=10000)
