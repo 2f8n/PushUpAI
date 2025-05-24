@@ -1,171 +1,189 @@
 from flask import Flask, request
-import requests
 import os
 import json
+import requests
+import pdfplumber
+from PIL import Image
+import pytesseract
 import google.generativeai as genai
 
 app = Flask(__name__)
 
-# --- Environment variables ---
-VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "studymate_verify")
-ACCESS_TOKEN = os.environ.get("ACCESS_TOKEN", "")
-PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID", "")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+# ─── Environment Variables ───────────────────────────────────────────────
+VERIFY_TOKEN    = os.getenv("VERIFY_TOKEN", "your_verify_token")
+ACCESS_TOKEN    = os.getenv("ACCESS_TOKEN", "")
+PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID", "")
+GEMINI_API_KEY  = os.getenv("GEMINI_API_KEY", "")
 
-# --- Configure Gemini ---
+# ─── Initialize Gemini ───────────────────────────────────────────────────
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel("gemini-1.5-pro-002")
+MODEL_NAME = "gemini-1.5-pro-002"
 
-# --- System prompt ---
-SYSTEM_PROMPT = (
-    "You are StudyMate AI, founded by ByteWave Media, an enthusiastic academic tutor on WhatsApp. "
-    "Never start with a greeting. Maintain conversation context and provide accurate, step-by-step solutions for study queries. "
-    "For non-study messages, reply concisely. Do not mention technical details or that you are an AI."
-)
+# ─── In-Memory Conversation State ────────────────────────────────────────
+# Holds last parsed file text per user for this session only
+user_states = {}  # e.g. { phone_number: { "last_file_text": "...", "last_file_type": "pdf" } }
 
-# --- Ensure memory directory ---
-if not os.path.exists("memory"):
-    os.makedirs("memory")
+# ─── Persistent User Memory ──────────────────────────────────────────────
+def memory_path(phone): 
+    return f"memory/{phone}.json"
 
-# --- Memory helpers ---
-def load_memory(phone):
-    path = f"memory/{phone}.json"
-    if os.path.exists(path):
-        with open(path) as f:
+def load_user_memory(phone):
+    try:
+        with open(memory_path(phone)) as f:
             return json.load(f)
-    return {"history": []}
+    except FileNotFoundError:
+        return {}
 
-
-def save_memory(phone, data):
-    path = f"memory/{phone}.json"
-    with open(path, "w") as f:
+def save_user_memory(phone, data):
+    os.makedirs("memory", exist_ok=True)
+    with open(memory_path(phone), "w") as f:
         json.dump(data, f)
 
-# --- Type checks ---
-def is_name_question(text):
-    q = text.lower()
-    return any(phrase in q for phrase in ["what's my name", "whats my name", "who am i"])
+# ─── File Parsing Helpers ────────────────────────────────────────────────
+def download_media(url, dest_path):
+    resp = requests.get(url)
+    resp.raise_for_status()
+    with open(dest_path, "wb") as f:
+        f.write(resp.content)
+    return dest_path
 
-# --- Build prompt with history ---
-def build_prompt(name, history, user_text):
-    convo = "".join([f"Student: {h['user']}\nTutor: {h.get('bot','')}\n" for h in history[-4:]])
-    return (
-        SYSTEM_PROMPT + "\n--- Conversation so far: ---\n" + convo +
-        f"Student: {user_text}\nTutor:"
-    )
+def parse_pdf(path):
+    text_pages = []
+    with pdfplumber.open(path) as pdf:
+        for page in pdf.pages:
+            text_pages.append(page.extract_text() or "")
+    return "\n".join(text_pages)
 
-# --- WhatsApp helpers ---
-def send_text(phone, text):
-    url = f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages"
-    headers = {"Authorization": f"Bearer {ACCESS_TOKEN}", "Content-Type": "application/json"}
-    payload = {"messaging_product":"whatsapp","to":phone,"type":"text","text":{"body":text}}
-    requests.post(url, headers=headers, json=payload)
+def parse_image(path):
+    img = Image.open(path)
+    return pytesseract.image_to_string(img)
 
-
-def send_buttons(phone, text):
+# ─── WhatsApp Message Sender ─────────────────────────────────────────────
+def send_whatsapp_message(phone, text):
     url = f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages"
     headers = {"Authorization": f"Bearer {ACCESS_TOKEN}", "Content-Type": "application/json"}
     payload = {
         "messaging_product": "whatsapp",
         "to": phone,
-        "type": "interactive",
-        "interactive": {
-            "type": "button",
-            "body": {"text": text},
-            "action": {"buttons": [
-                {"type": "reply", "reply": {"id": "understood", "title": "Understood"}},
-                {"type": "reply", "reply": {"id": "explain_more", "title": "Explain more"}}
-            ]}
-        }
+        "type": "text",
+        "text": {"body": text}
     }
-    requests.post(url, headers=headers, json=payload)
+    resp = requests.post(url, headers=headers, json=payload)
+    print("Sent to WhatsApp:", resp.status_code, resp.text)
 
-# --- Webhook ---
-@app.route("/webhook", methods=["GET","POST"])
+# ─── Generate AI Reply ────────────────────────────────────────────────────
+def get_gemini_reply(prompt, name="Student"):
+    system_prompt = f"""
+You are StudyMate AI, a passionate, mentor-style tutor (founded by ByteWave Media, mention only if asked).
+Use name: {name}.  
+Answer clearly, step by step, skipping any greeting intros.  
+Only after multi-step explanations should you send a follow-up check.  
+"""
+    try:
+        model = genai.GenerativeModel(MODEL_NAME)
+        response = model.generate_content(system_prompt + "\n" + prompt)
+        return response.text.strip()
+    except Exception as e:
+        print("Gemini error:", e)
+        return "Sorry, something went wrong. Try again soon!"
+
+# ─── Webhook Endpoint ────────────────────────────────────────────────────
+@app.route("/webhook", methods=["GET", "POST"])
 def webhook():
     if request.method == "GET":
-        token = request.args.get("hub.verify_token")
-        if token == VERIFY_TOKEN:
-            return request.args.get("hub.challenge"), 200
+        mode, token, challenge = (request.args.get("hub.mode"),
+                                   request.args.get("hub.verify_token"),
+                                   request.args.get("hub.challenge"))
+        if mode == "subscribe" and token == VERIFY_TOKEN:
+            return challenge, 200
         return "Verification failed", 403
 
-    data = request.json
-    try:
-        change = data["entry"][0]["changes"][0]["value"]
-        msgs = change.get("messages") or []
-        if not msgs:
-            return "OK", 200
+    # POST: handle incoming messages
+    incoming = request.json
+    change = incoming["entry"][0]["changes"][0]["value"]
+    if "messages" not in change:
+        return "OK", 200
 
-        msg = msgs[0]
-        phone = msg.get("from")
-        # Handle interactive replies first
-        interactive = msg.get("interactive")
-        mem = load_memory(phone)
-        history = mem.get("history", [])
+    msg   = change["messages"][0]
+    phone = msg["from"]
+    text  = msg.get("text", {}).get("body", "").strip().lower()
 
-        if interactive:
-            btn = interactive.get("button_reply", {}).get("id")
-            # User understood
-            if btn == "understood":
-                send_text(phone, "Great! What would you like to tackle next?")
-            # User wants more explanation
-            elif btn == "explain_more":
-                last = history[-1] if history else None
-                if last:
-                    last_query = last["user"]
-                    prompt = build_prompt(mem.get("name"), history, f"Please explain the previous solution in more detail.")
-                    res = model.generate_content(prompt)
-                    reply2 = res.text.strip()
-                    send_text(phone, reply2)
-                    send_buttons(phone, "Did that make sense to you?")
-                else:
-                    send_text(phone, "Sure—what part would you like me to go over again?")
-            return "OK", 200
+    # Load persistent memory (name, etc.)
+    memory = load_user_memory(phone)
 
-        # Get text message body
-        text = msg.get("text", {}).get("body", "").strip()
-        if not phone or not text:
-            return "OK", 200
+    # Initialize ephemeral state if needed
+    if phone not in user_states:
+        user_states[phone] = {}
 
-        name = mem.get("name")
-        # Onboarding for name
-        if not name:
-            if len(text.split()) >= 2 and text.replace(" ", "").isalpha():
-                mem["name"] = text
-                save_memory(phone, mem)
-                send_text(phone, f"Awesome, {text.split()[0]}! What would you like to study today?")
-            else:
-                send_text(phone, "Hey! What's your full name so I know what to call you?")
-            return "OK", 200
-
-        # Identity check
-        if is_name_question(text):
-            send_text(phone, f"You're {name}! Let's keep going.")
-            return "OK", 200
-
-        # Build prompt and get response
-        prompt = build_prompt(name, history, text)
-        res = model.generate_content(prompt)
-        reply = res.text.strip()
-
-        # Clean up any greetings
-        for g in ["Hi,", "Hello,", "Hey,"]:
-            if reply.startswith(g): reply = reply[len(g):].strip()
-
-        # Update history
-        history.append({"user": text, "bot": reply})
-        mem["history"] = history[-20:]
-        save_memory(phone, mem)
-
-        # Decide if explanation (multi-sentence)
-        if '.' in reply and len(reply.split('.')) > 1:
-            send_text(phone, reply)
-            send_buttons(phone, "Did that make sense to you?")
+    # 1) Onboarding: collect full name
+    if "name" not in memory:
+        # Only accept multi-word as “full name”
+        if len(text.split()) >= 2:
+            memory["name"] = msg["text"]["body"].strip()
+            save_user_memory(phone, memory)
+            send_whatsapp_message(phone,
+                f"Nice to meet you, {memory['name']}! What would you like to study today?"
+            )
         else:
-            send_text(phone, reply)
+            send_whatsapp_message(phone,
+                "Hey! Could you share your full first and last name so I know what to call you?"
+            )
+        return "OK", 200
 
-    except Exception as e:
-        print("Error:", e)
+    # 2) Media upload handling (PDF or image)
+    mtype = msg.get("type")
+    if mtype in ("document", "image"):
+        media_id = msg[mtype]["id"]
+        # 2a) fetch URL
+        meta = requests.get(
+            f"https://graph.facebook.com/v19.0/{media_id}",
+            params={"fields": "url", "access_token": ACCESS_TOKEN}
+        ).json()
+        url = meta.get("url")
+        # 2b) download to temp
+        os.makedirs("uploads", exist_ok=True)
+        path = download_media(url, f"uploads/{media_id}")
+        # 2c) parse
+        if mtype == "document":
+            parsed = parse_pdf(path); ftype = "PDF"
+        else:
+            parsed = parse_image(path); ftype = "image"
+        # 2d) store parsed text in ephemeral state
+        user_states[phone]["last_file_text"] = parsed
+        user_states[phone]["last_file_type"] = ftype.lower()
+        # 2e) ask next action
+        send_whatsapp_message(phone,
+            f"Got your {ftype}! What would you like me to do with it? "
+            f"Reply **summarize** or **quiz**."
+        )
+        return "OK", 200
+
+    # 3) Commands on parsed text
+    if text == "summarize":
+        parsed = user_states[phone].get("last_file_text")
+        if not parsed:
+            send_whatsapp_message(phone, "I don't see any recent file. Please upload first.")
+        else:
+            prompt = f"Please summarize the following content:\n\n{parsed}"
+            summary = get_gemini_reply(prompt, name=memory["name"])
+            send_whatsapp_message(phone, summary)
+        return "OK", 200
+
+    if text == "quiz":
+        parsed = user_states[phone].get("last_file_text")
+        if not parsed:
+            send_whatsapp_message(phone, "I don't see any recent file. Please upload first.")
+        else:
+            prompt = f"Create a 5-question quiz (with answers) based on this text:\n\n{parsed}"
+            quiz = get_gemini_reply(prompt, name=memory["name"])
+            send_whatsapp_message(phone, quiz)
+        return "OK", 200
+
+    # 4) Regular academic Q&A
+    # Build a user-specific prompt
+    user_question = msg.get("text", {}).get("body", "").strip()
+    ai_reply = get_gemini_reply(f"Question: {user_question}", name=memory["name"])
+    send_whatsapp_message(phone, ai_reply)
     return "OK", 200
 
 if __name__ == "__main__":
