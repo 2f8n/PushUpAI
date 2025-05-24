@@ -2,3 +2,6 @@ flask
 requests
 gunicorn
 google-generativeai
+pdfplumber
+pytesseract
+Pillow
