@@ -18,13 +18,11 @@ model = genai.GenerativeModel("gemini-1.5-pro-002")
 
 # --- System instruction for StudyMate AI ---
 SYSTEM_PROMPT = (
-    "You are StudyMate AI, an engaging and enthusiastic academic tutor on WhatsApp. "
-    "When assisting a student, show genuine excitement and passion about their learning journey. "
-    "Offer detailed examples, step-by-step guidance, and words of encouragement. "
-    "Avoid robotic or dry responses—be personable and empathetic. "
-    "Never mention technical details or that you’re an AI model. "
-    "Keep informal banter brief. "
-    "End educational replies with: 'Did that make sense to you? ✅ Yes or ❓ Not yet?'."
+    "You are StudyMate AI, a passionate, enthusiastic academic tutor on WhatsApp. "
+    "Do NOT start responses with greetings like 'hi' or 'hello'. "
+    "Give concise replies when casual, but detailed, step-by-step explanations for study queries. "
+    "Offer encouragement and examples. Never mention you're an AI model. "
+    "After instructional replies, ask 'Did that make sense to you?' "
 )
 
 # --- Ensure memory directory exists ---
@@ -56,11 +54,11 @@ def build_tutor_prompt(user_name, user_text):
     return (
         SYSTEM_PROMPT + "\n---\n"
         f"Student Name: {user_name}\n"
-        f"Question: {user_text}\n---\n"
-        "Tutor:"  # model completes here
+        f"User Query: {user_text}\n---\n"
+        "Answer:"  # Model completes here
     )
 
-# --- Send WhatsApp message ---
+# --- Send WhatsApp text message ---
 def send_whatsapp_message(phone, text):
     url = f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages"
     headers = {
@@ -73,65 +71,90 @@ def send_whatsapp_message(phone, text):
         "type": "text",
         "text": {"body": text}
     }
-    response = requests.post(url, headers=headers, json=payload)
-    print("WhatsApp API response:", response.status_code, response.text)
-    return response.json()
+    requests.post(url, headers=headers, json=payload)
+
+# --- Send WhatsApp interactive buttons ---
+def send_whatsapp_buttons(phone, text):
+    url = f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages"
+    headers = {
+        "Authorization": f"Bearer {ACCESS_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": phone,
+        "type": "interactive",
+        "interactive": {
+            "type": "button",
+            "body": {"text": text},
+            "action": {"buttons": [
+                {"type": "reply", "reply": {"id": "yes", "title": "✅ Yes"}},
+                {"type": "reply", "reply": {"id": "not_yet", "title": "❓ Not yet"}}
+            ]}
+        }
+    }
+    requests.post(url, headers=headers, json=payload)
 
 # --- Webhook endpoint ---
 @app.route("/webhook", methods=["GET", "POST"])
 def webhook():
     if request.method == "GET":
-        mode = request.args.get("hub.mode")
-        token = request.args.get("hub.verify_token")
-        challenge = request.args.get("hub.challenge")
-        if mode == "subscribe" and token == VERIFY_TOKEN:
-            return challenge, 200
+        if request.args.get("hub.verify_token") == VERIFY_TOKEN:
+            return request.args.get("hub.challenge"), 200
         return "Verification failed", 403
 
-    if request.method == "POST":
-        data = request.json
-        try:
-            change = data["entry"][0]["changes"][0]["value"]
-            messages = change.get("messages")
-            if not messages:
-                return "OK", 200
+    data = request.json
+    try:
+        change = data["entry"][0]["changes"][0]["value"]
+        messages = change.get("messages")
+        if not messages:
+            return "OK", 200
 
-            msg = messages[0]
-            phone = msg["from"]
-            text = msg.get("text", {}).get("body", "").strip()
-            if not text:
-                return "OK", 200
+        msg = messages[0]
+        phone = msg["from"]
+        text = msg.get("text", {}).get("body", "").strip()
+        if not text:
+            return "OK", 200
 
-            memory = load_user_memory(phone)
-            name = memory.get("name")
+        memory = load_user_memory(phone)
+        name = memory.get("name")
 
-            # Onboarding: ask full name
-            if not name:
-                if len(text.split()) >= 2 and text.replace(" ", "").isalpha():
-                    memory["name"] = text
-                    save_user_memory(phone, memory)
-                    send_whatsapp_message(phone, f"Awesome, {text.split()[0]}! Let’s get started with your studies 😊")
-                else:
-                    send_whatsapp_message(phone, "Hi there! Please share your *full name* (first and last) so I can personalize our tutoring.")
-                return "OK", 200
+        # Onboarding: get full name
+        if not name:
+            if len(text.split()) >= 2 and text.replace(" ", "").isalpha():
+                memory["name"] = text
+                save_user_memory(phone, memory)
+                send_whatsapp_message(phone, f"Great, {text.split()[0]}! Ready to dive into your studies? 📚")
+            else:
+                send_whatsapp_message(phone, "Please provide your *full name* (first and last) so I can personalize your sessions.")
+            return "OK", 200
 
-            # If user asks their name
-            if is_name_question(text):
-                send_whatsapp_message(phone, f"You’re {name}! Let’s continue learning together 🙌")
-                return "OK", 200
+        # If user asks their name or identity
+        if is_name_question(text):
+            send_whatsapp_message(phone, f"You are {name}! 😊 Let's keep learning.")
+            return "OK", 200
 
-            # Thinking indicator
-            send_whatsapp_message(phone, "🤖 Thinking...")
+        # Thinking indicator
+        send_whatsapp_message(phone, "🤖 Thinking...")
 
-            # Generate and send tutor response
-            prompt = build_tutor_prompt(name, text)
-            response = model.generate_content(prompt)
-            reply = response.text.strip()
+        # Build and send AI response
+        prompt = build_tutor_prompt(name, text)
+        response = model.generate_content(prompt)
+        reply = response.text.strip()
+
+        # Strip leading greetings
+        reply = reply.lstrip('Hi').lstrip('Hello').lstrip('Hey').strip()
+
+        # If reply ends with check, use buttons
+        if reply.endswith("Did that make sense to you? ✅ Yes or ❓ Not yet?"):
+            core = reply.replace("Did that make sense to you? ✅ Yes or ❓ Not yet?", "").strip()
+            send_whatsapp_buttons(phone, core)
+        else:
             send_whatsapp_message(phone, reply)
 
-        except Exception as e:
-            print("Error handling message:", e)
-        return "OK", 200
+    except Exception as e:
+        print("Error handling message:", e)
+    return "OK", 200
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
