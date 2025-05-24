@@ -3,48 +3,56 @@ import requests
 import os
 import json
 import google.generativeai as genai
-from pathlib import Path
+from datetime import datetime
 
-# Configure Flask app
 app = Flask(__name__)
 
-# Load environment variables
-VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "studymate_verify")
+# === ENV ===
+VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "pushupai_verify_token")
 ACCESS_TOKEN = os.environ.get("ACCESS_TOKEN", "")
 PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID", "")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+MEMORY_DIR = "memory"
 
-# Initialize Gemini
+# === Gemini Setup ===
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel("gemini-1.5-pro-002")
+model = genai.GenerativeModel("gemini-pro")
 
-# Ensure memory directory exists
-Path("memory").mkdir(parents=True, exist_ok=True)
+# === Ensure memory dir exists ===
+os.makedirs(MEMORY_DIR, exist_ok=True)
 
-# Helper: Load user memory
-def load_memory(user_id):
-    memory_file = Path(f"memory/{user_id}.json")
-    if memory_file.exists():
-        with open(memory_file) as f:
+# === AI Prompt Boilerplate ===
+def studymate_prompt(user_name, user_input):
+    system_instruction = f"""
+You are StudyMate AI, an empathetic and expert academic tutor helping students via WhatsApp.
+Your tone is helpful, concise, and kind. Greet only once during onboarding.
+Your task is to reply based on the student's input below.
+If the input is just a greeting (like 'hi'), do not assume it's their name.
+Avoid repeating greetings. If the user's name is not known, ask clearly:
+\"Can I get your full name so I can personalize your experience?\"
+Otherwise, be concise unless the message is study-related, then give a full educational response.
+Always end with: \"Did that make sense to you? ✅ Yes or ❓ Not yet?\"
+"""
+    return f"""{system_instruction}
+
+Student name: {user_name or '[Unknown]'}
+Message: {user_input}
+"""
+
+# === User Memory ===
+def get_user_memory(user_id):
+    path = os.path.join(MEMORY_DIR, f"{user_id}.json")
+    if os.path.exists(path):
+        with open(path, "r") as f:
             return json.load(f)
-    else:
-        return {}
+    return {}
 
-# Helper: Save user memory
-def save_memory(user_id, memory):
-    with open(f"memory/{user_id}.json", "w") as f:
+def save_user_memory(user_id, memory):
+    path = os.path.join(MEMORY_DIR, f"{user_id}.json")
+    with open(path, "w") as f:
         json.dump(memory, f)
 
-# Gemini reply handler
-def get_gemini_reply(prompt):
-    try:
-        response = model.generate_content(prompt)
-        return response.text.strip()
-    except Exception as e:
-        print("Gemini error:", e)
-        return "Sorry, I had trouble responding. Try again soon."
-
-# WhatsApp reply sender
+# === WhatsApp API ===
 def send_whatsapp_message(phone_number, text):
     url = f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages"
     headers = {
@@ -60,7 +68,7 @@ def send_whatsapp_message(phone_number, text):
     response = requests.post(url, headers=headers, json=payload)
     print("WhatsApp API response:", response.status_code, response.text)
 
-# Webhook endpoint
+# === Webhook ===
 @app.route("/webhook", methods=["GET", "POST"])
 def webhook():
     if request.method == "GET":
@@ -74,43 +82,45 @@ def webhook():
     if request.method == "POST":
         data = request.json
         try:
-            msg = data["entry"][0]["changes"][0]["value"].get("messages")
-            if not msg:
+            entry = data["entry"][0]
+            changes = entry["changes"][0]["value"]
+            messages = changes.get("messages")
+            if not messages:
                 print("Webhook received non-message event.")
                 return "OK", 200
 
-            msg = msg[0]
+            msg = messages[0]
             user_id = msg["from"]
-            user_text = msg.get("text", {}).get("body", "").strip()
+            text = msg.get("text", {}).get("body", "").strip()
+            if not text:
+                return "OK", 200
 
-            memory = load_memory(user_id)
+            memory = get_user_memory(user_id)
+            user_name = memory.get("name")
 
-            # Ask for name if not set
-            if "full_name" not in memory:
-                if "waiting_for_name" in memory:
-                    name = user_text
-                    if len(name.split()) >= 2:
-                        memory["full_name"] = name
-                        del memory["waiting_for_name"]
-                        save_memory(user_id, memory)
-                        send_whatsapp_message(user_id, f"Nice to meet you, {name.split()[0]}! I'm StudyMate AI. How can I help with your studying today?")
-                        return "OK", 200
-                    else:
-                        send_whatsapp_message(user_id, "Please enter your *full name* (first and last).")
-                        return "OK", 200
+            if not user_name:
+                if text.lower() in ["hi", "hello", "hey"]:
+                    send_whatsapp_message(user_id, "👋 Hi there! What's your full name so I can personalize your StudyMate experience?")
+                    return "OK", 200
+                elif len(text.split()) >= 2:
+                    memory["name"] = text.strip()
+                    save_user_memory(user_id, memory)
+                    send_whatsapp_message(user_id, f"Thanks, {text.strip().split()[0]}! You can now ask me anything to get started ✨")
+                    return "OK", 200
                 else:
-                    memory["waiting_for_name"] = True
-                    save_memory(user_id, memory)
-                    send_whatsapp_message(user_id, "Hi! Before we begin, what's your *full name*?")
+                    send_whatsapp_message(user_id, "Please enter your full name (first and last) ✍️")
                     return "OK", 200
 
-            prompt = f"You are StudyMate AI, a friendly WhatsApp tutor. {user_text}"
-            reply = get_gemini_reply(prompt)
-            send_whatsapp_message(user_id, reply)
+            # Send thinking...
+            send_whatsapp_message(user_id, "🤖 Thinking...")
 
+            prompt = studymate_prompt(user_name, text)
+            response = model.generate_content(prompt)
+            reply = response.text.strip()
+
+            send_whatsapp_message(user_id, reply)
         except Exception as e:
             print("Error handling message:", e)
-
         return "OK", 200
 
 if __name__ == "__main__":
