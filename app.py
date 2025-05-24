@@ -14,7 +14,7 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 
 # Configure Gemini
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel("gemini-pro")
+model = genai.GenerativeModel("gemini-1.5-pro-002")
 
 # Ensure memory directory exists
 if not os.path.exists("memory"):
@@ -34,7 +34,13 @@ def save_user_memory(phone, data):
 
 def is_name_question(text):
     text = text.lower()
-    return any(q in text for q in ["what's my name", "whats my name", "who am i"])
+    # Recognize various phrasings asking for user's name
+    return any(q in text for q in [
+        "what's my name",
+        "whats my name",
+        "what is my name",
+        "who am i"
+    ])
 
 def get_gemini_reply(prompt, context=""):
     try:
