@@ -3,38 +3,48 @@ import requests
 import os
 import json
 import google.generativeai as genai
+from pathlib import Path
 
+# Configure Flask app
 app = Flask(__name__)
 
-# 🔐 Environment variables
-VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "pushupai_verify_token")
+# Load environment variables
+VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "studymate_verify")
 ACCESS_TOKEN = os.environ.get("ACCESS_TOKEN", "")
 PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID", "")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 
-# 🧠 Gemini configuration
+# Initialize Gemini
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel("gemini-pro")
+model = genai.GenerativeModel("gemini-1.5-pro-002")
 
-# 📁 Memory handling
-def memory_path(phone):
-    return f"memory/{phone}.json"
+# Ensure memory directory exists
+Path("memory").mkdir(parents=True, exist_ok=True)
 
-def load_user_memory(phone):
-    try:
-        with open(memory_path(phone), "r") as f:
+# Helper: Load user memory
+def load_memory(user_id):
+    memory_file = Path(f"memory/{user_id}.json")
+    if memory_file.exists():
+        with open(memory_file) as f:
             return json.load(f)
-    except FileNotFoundError:
+    else:
         return {}
 
-def save_user_memory(phone, data):
-    os.makedirs("memory", exist_ok=True)
-    path = memory_path(phone)
-    with open(path, "w") as f:
-        json.dump(data, f)
-    print(f"[✔] Memory saved for {phone} → {path}")
+# Helper: Save user memory
+def save_memory(user_id, memory):
+    with open(f"memory/{user_id}.json", "w") as f:
+        json.dump(memory, f)
 
-# 📩 WhatsApp reply function
+# Gemini reply handler
+def get_gemini_reply(prompt):
+    try:
+        response = model.generate_content(prompt)
+        return response.text.strip()
+    except Exception as e:
+        print("Gemini error:", e)
+        return "Sorry, I had trouble responding. Try again soon."
+
+# WhatsApp reply sender
 def send_whatsapp_message(phone_number, text):
     url = f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages"
     headers = {
@@ -50,16 +60,7 @@ def send_whatsapp_message(phone_number, text):
     response = requests.post(url, headers=headers, json=payload)
     print("WhatsApp API response:", response.status_code, response.text)
 
-# 🤖 Gemini response generation
-def get_gemini_reply(prompt):
-    try:
-        response = model.generate_content(prompt)
-        return response.text.strip()
-    except Exception as e:
-        print("Gemini error:", e)
-        return "Sorry, I had trouble responding. Try again soon!"
-
-# 📬 Webhook logic
+# Webhook endpoint
 @app.route("/webhook", methods=["GET", "POST"])
 def webhook():
     if request.method == "GET":
@@ -73,32 +74,43 @@ def webhook():
     if request.method == "POST":
         data = request.json
         try:
-            message_entry = data["entry"][0]["changes"][0]["value"]
-            if "messages" not in message_entry:
+            msg = data["entry"][0]["changes"][0]["value"].get("messages")
+            if not msg:
                 print("Webhook received non-message event.")
                 return "OK", 200
 
-            msg = message_entry["messages"][0]
-            phone = msg["from"]
-            user_text = msg["text"]["body"].strip()
+            msg = msg[0]
+            user_id = msg["from"]
+            user_text = msg.get("text", {}).get("body", "").strip()
 
-            memory = load_user_memory(phone)
+            memory = load_memory(user_id)
 
-            # Ask for name if not stored
-            if "name" not in memory:
-                memory["name"] = user_text
-                save_user_memory(phone, memory)
-                send_whatsapp_message(phone, f"Nice to meet you, {user_text}! 🎓 How can I help you study today?")
-                return "OK", 200
+            # Ask for name if not set
+            if "full_name" not in memory:
+                if "waiting_for_name" in memory:
+                    name = user_text
+                    if len(name.split()) >= 2:
+                        memory["full_name"] = name
+                        del memory["waiting_for_name"]
+                        save_memory(user_id, memory)
+                        send_whatsapp_message(user_id, f"Nice to meet you, {name.split()[0]}! I'm StudyMate AI. How can I help with your studying today?")
+                        return "OK", 200
+                    else:
+                        send_whatsapp_message(user_id, "Please enter your *full name* (first and last).")
+                        return "OK", 200
+                else:
+                    memory["waiting_for_name"] = True
+                    save_memory(user_id, memory)
+                    send_whatsapp_message(user_id, "Hi! Before we begin, what's your *full name*?")
+                    return "OK", 200
 
-            # Use stored name and respond via Gemini
-            user_name = memory["name"]
-            prompt = f"You're StudyMate AI helping {user_name}. Question: {user_text}"
+            prompt = f"You are StudyMate AI, a friendly WhatsApp tutor. {user_text}"
             reply = get_gemini_reply(prompt)
-            send_whatsapp_message(phone, reply)
+            send_whatsapp_message(user_id, reply)
 
         except Exception as e:
             print("Error handling message:", e)
+
         return "OK", 200
 
 if __name__ == "__main__":
