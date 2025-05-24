@@ -1,13 +1,12 @@
 # File: app.py
 
 from flask import Flask, request
-import os
-import json
-import requests
+import os, json, requests
 import pdfplumber
 from PIL import Image
 import pytesseract
 import google.generativeai as genai
+from requests.exceptions import HTTPError
 
 app = Flask(__name__)
 
@@ -16,17 +15,14 @@ VERIFY_TOKEN    = os.getenv("VERIFY_TOKEN", "your_verify_token")
 ACCESS_TOKEN    = os.getenv("ACCESS_TOKEN", "")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID", "")
 GEMINI_API_KEY  = os.getenv("GEMINI_API_KEY", "")
-MODEL_NAME      = "gemini-1.5-pro-002"
+MODEL_NAME      = "gemini-1.5-pro-002"  # adjust as needed
 
 # ─── Initialize Gemini ───────────────────────────────────────────────────
 genai.configure(api_key=GEMINI_API_KEY)
 
-# ─── In-Memory State (per-conversation) ──────────────────────────────────
-user_states = {}  
-# { phone: { "last_file_text": str, "last_file_type": "pdf"/"image",
-#            "last_user_q": str } }
+# ─── In-Memory State & Persistent Memory ─────────────────────────────────
+user_states = {}  # ephemeral per-phone conversation context
 
-# ─── Persistent Memory (name, etc.) ──────────────────────────────────────
 def memory_path(phone): return f"memory/{phone}.json"
 
 def load_user_memory(phone):
@@ -40,38 +36,57 @@ def save_user_memory(phone, data):
     with open(memory_path(phone), "w") as f:
         json.dump(data, f)
 
-# ─── Helpers: download & parse ───────────────────────────────────────────
+# ─── Helpers: Fetch Media URL & Download ─────────────────────────────────
+def get_media_url(media_id):
+    """Fetch the expiring download URL for a document/image."""
+    url = f"https://graph.facebook.com/v19.0/{media_id}"
+    headers = {"Authorization": f"Bearer {ACCESS_TOKEN}"}
+    resp = requests.get(url, headers=headers, params={"fields":"url"})
+    resp.raise_for_status()
+    return resp.json()["url"]
+
 def download_media(url, dest):
-    r = requests.get(url); r.raise_for_status()
-    with open(dest, "wb") as f: f.write(r.content)
+    """Download the actual bytes of the PDF/image, using the same bearer token."""
+    headers = {"Authorization": f"Bearer {ACCESS_TOKEN}"}
+    r = requests.get(url, headers=headers)
+    r.raise_for_status()
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    with open(dest, "wb") as f:
+        f.write(r.content)
     return dest
 
+# ─── Parsers ──────────────────────────────────────────────────────────────
 def parse_pdf(path):
-    text_pages = []
+    text = []
     with pdfplumber.open(path) as pdf:
-        for pg in pdf.pages:
-            text_pages.append(pg.extract_text() or "")
-    return "\n".join(text_pages)
+        for p in pdf.pages:
+            text.append(p.extract_text() or "")
+    return "\n".join(text)
 
 def parse_image(path):
     img = Image.open(path)
     return pytesseract.image_to_string(img)
 
-# ─── WhatsApp Sends ──────────────────────────────────────────────────────
+# ─── WhatsApp Senders ────────────────────────────────────────────────────
 def send_text(phone, text):
-    url = f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages"
-    hdr = {"Authorization":f"Bearer {ACCESS_TOKEN}","Content-Type":"application/json"}
     payload = {
         "messaging_product":"whatsapp","to":phone,
         "type":"text","text":{"body":text}
     }
-    r = requests.post(url, headers=hdr, json=payload)
+    headers = {
+        "Authorization":f"Bearer {ACCESS_TOKEN}",
+        "Content-Type":"application/json"
+    }
+    r = requests.post(
+        f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages",
+        headers=headers, json=payload
+    )
     print("→ text", r.status_code, r.text)
 
 def send_buttons(phone, text):
-    """Send a message with two quick-reply buttons."""
-    url = f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages"
-    hdr = {"Authorization":f"Bearer {ACCESS_TOKEN}","Content-Type":"application/json"}
+    """Quick-reply buttons: Understood / Explain more"""
+    if not text:
+        text = "Sorry—that response was empty. Can you rephrase?"
     buttons = [
         {"type":"reply","reply":{"id":"understood","title":"Understood"}},
         {"type":"reply","reply":{"id":"explain_more","title":"Explain more"}}
@@ -81,134 +96,147 @@ def send_buttons(phone, text):
         "type":"interactive",
         "interactive":{
             "type":"button",
-            "body":{"text":text},
+            "body":{"text": text[:1024]},  # max 1024 chars
             "action":{"buttons":buttons}
         }
     }
-    r = requests.post(url, headers=hdr, json=payload)
+    headers = {
+        "Authorization":f"Bearer {ACCESS_TOKEN}",
+        "Content-Type":"application/json"
+    }
+    r = requests.post(
+        f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages",
+        headers=headers, json=payload
+    )
     print("→ buttons", r.status_code, r.text)
 
-# ─── Gemini Reply ────────────────────────────────────────────────────────
-def get_gemini_reply(prompt, name="Student"):
-    system = f"""
-You are StudyMate AI, a passionate tutor (founded by ByteWave Media; mention only if asked).
-Use name: {name}.  
-Answer step-by-step, skipping any “Hi” intros.  
-After each multi-step explanation, I will ask “Did that make sense?”
-"""
+# ─── Gemini Query ────────────────────────────────────────────────────────
+def get_gemini_reply(prompt, name):
+    system_prompt = f"""
+You are StudyMate AI, a warm, enthusiastic tutor (founded by ByteWave Media; mention only if asked).
+Always address the student by name ({name}).  
+• Never start with "Hi" or long greetings—dive straight in.  
+• If the question is vague, ask for clarification: "Could you clarify what specific aspect you’d like to focus on?"  
+• Give concise answers, step by step.  """
     try:
         model = genai.GenerativeModel(MODEL_NAME)
-        res = model.generate_content(system + "\n" + prompt)
+        res = model.generate_content(system_prompt + "\n\nUser: " + prompt)
         return res.text.strip()
     except Exception as e:
         print("Gemini error:", e)
-        return "Sorry, I’m having trouble right now."
+        return ""
 
 # ─── Webhook Endpoint ────────────────────────────────────────────────────
 @app.route("/webhook", methods=["GET","POST"])
 def webhook():
-    if request.method=="GET":
-        if (request.args.get("hub.mode")=="subscribe" and
-            request.args.get("hub.verify_token")==VERIFY_TOKEN):
+    if request.method == "GET":
+        if (request.args.get("hub.mode")=="subscribe"
+            and request.args.get("hub.verify_token")==VERIFY_TOKEN):
             return request.args.get("hub.challenge"), 200
-        return "Fail", 403
+        return "Verification failed", 403
 
     data = request.json
-    change = data["entry"][0]["changes"][0]["value"]
-    if "messages" not in change:
+    changes = data["entry"][0]["changes"][0]["value"]
+    if "messages" not in changes:
         return "OK", 200
 
-    msg   = change["messages"][0]
+    msg   = changes["messages"][0]
     phone = msg["from"]
     mtype = msg.get("type")
     text  = msg.get("text",{}).get("body","").strip()
 
-    # Load memory
+    # Load or create memory + ephemeral state
     memory = load_user_memory(phone)
-    # Ensure ephemeral state
-    if phone not in user_states:
-        user_states[phone] = {}
+    user_states.setdefault(phone, {})
 
-    # 1) Onboarding: ask for full name
+    # ─── 1) Onboard: ask for full name ─────────────────────────────────
     if "name" not in memory:
         if len(text.split()) >= 2:
             memory["name"] = text
             save_user_memory(phone, memory)
-            send_text(phone, f"Great, {memory['name']}! What do you want to study today?")
+            send_text(phone, f"Nice to meet you, {memory['name']}! What topic should we tackle today?")
         else:
-            send_text(phone,
-                "Hey! Could you tell me your full name (first & last)?")
+            send_text(phone, "Welcome! What’s your full name (first & last)?")
         return "OK", 200
 
-    # 2) Button reply handling
-    if mtype == "interactive":
-        btn = msg["interactive"]["button_reply"]["id"]
-        if btn == "understood":
-            send_text(phone, "Awesome! What would you like to tackle next?")
-        elif btn == "explain_more":
-            last_q = user_states[phone].get("last_user_q","")
-            if last_q:
-                prompt = f"Please explain in more detail: {last_q}"
-                more = get_gemini_reply(prompt, name=memory["name"])
-                # store again to allow another round
-                user_states[phone]["last_user_q"] = last_q
-                send_buttons(phone, more)
-            else:
-                send_text(phone, "Can you remind me your question?")
+    # ─── 2) Handle button replies ────────────────────────────────────────
+    payload_id = None
+    if mtype == "interactive" and "button_reply" in msg.get("interactive",{}):
+        payload_id = msg["interactive"]["button_reply"]["id"]
+    elif mtype == "button" and "payload" in msg.get("button",{}):
+        payload_id = msg["button"]["payload"]
+
+    if payload_id:
+        last_q = user_states[phone].get("last_user_q","")
+        if payload_id == "understood":
+            send_text(phone, "Great! What shall we study next?")
+        elif payload_id == "explain_more" and last_q:
+            more = get_gemini_reply("Please explain in more detail: "+ last_q,
+                                    memory["name"])
+            user_states[phone]["last_user_q"] = last_q
+            send_buttons(phone, more)
+        else:
+            send_text(phone, "Could you remind me your question?")
         return "OK", 200
 
-    # 3) Media (PDF/Image) upload
+    # ─── 3) Handle PDF / Image uploads ──────────────────────────────────
     if mtype in ("document","image"):
-        media_id = msg[mtype]["id"]
-        # fetch URL
-        meta = requests.get(
-            f"https://graph.facebook.com/v19.0/{media_id}",
-            params={"fields":"url","access_token":ACCESS_TOKEN}
-        ).json()
-        url = meta.get("url","")
-        os.makedirs("uploads", exist_ok=True)
-        path = download_media(url, f"uploads/{media_id}")
-        if mtype=="document":
-            parsed = parse_pdf(path)
-        else:
-            parsed = parse_image(path)
-        user_states[phone]["last_file_text"] = parsed
-        # ask next
-        send_text(phone,
-            f"I’ve read your {mtype.upper()}. Reply *summarize* or *quiz* when ready.")
+        media = msg[mtype]
+        try:
+            mid = media["id"]
+            url = get_media_url(mid)
+            local = f"uploads/{mid}"
+            path = download_media(url, local)
+            parsed = parse_pdf(path) if mtype=="document" else parse_image(path)
+            user_states[phone]["last_file_text"] = parsed
+            send_text(phone, f"I’ve read your {mtype}. Reply *summarize* or *quiz* when ready.")
+        except HTTPError as he:
+            print("Media download error:", he)
+            send_text(phone, "Sorry, I couldn’t fetch that file—please try again.")
+        except Exception as e:
+            print("Parsing error:", e)
+            send_text(phone, "Oops, something went wrong parsing your file.")
         return "OK", 200
 
-    # 4) Summarize or Quiz commands
+    # ─── 4) Summarize / Quiz commands ───────────────────────────────────
     cmd = text.lower()
     if cmd == "summarize":
-        parsed = user_states[phone].get("last_file_text")
+        parsed = user_states[phone].get("last_file_text","")
         if not parsed:
-            send_text(phone, "No file found—please upload first.")
+            send_text(phone, "No file on record—please upload a PDF or image first.")
         else:
-            summary = get_gemini_reply(f"Summarize:\n\n{parsed}", name=memory["name"])
-            # Show summary then buttons for follow-up
-            user_states[phone]["last_user_q"] = f"Summarize:\n\n{parsed}"
-            send_buttons(phone, summary)
+            summ = get_gemini_reply("Summarize the following:\n\n"+parsed,
+                                    memory["name"])
+            user_states[phone]["last_user_q"] = "Summarize:\n"+parsed
+            send_buttons(phone, summ)
         return "OK", 200
 
     if cmd == "quiz":
-        parsed = user_states[phone].get("last_file_text")
+        parsed = user_states[phone].get("last_file_text","")
         if not parsed:
-            send_text(phone, "No file found—please upload first.")
+            send_text(phone, "No file on record—please upload a PDF or image first.")
         else:
-            quiz = get_gemini_reply(f"Make a 5-question quiz on:\n\n{parsed}", name=memory["name"])
-            user_states[phone]["last_user_q"] = f"Quiz:\n\n{parsed}"
+            quiz = get_gemini_reply("Create a 5-question quiz on:\n\n"+parsed,
+                                    memory["name"])
+            user_states[phone]["last_user_q"] = "Quiz:\n"+parsed
             send_buttons(phone, quiz)
         return "OK", 200
 
-    # 5) Regular academic Q&A
-    # Store last question
+    # ─── 5) Pure Q&A ────────────────────────────────────────────────────
+    if not text:
+        send_text(phone, "I didn’t catch any text—what would you like to study?")
+        return "OK", 200
+
+    # store and ask Gemini
     user_states[phone]["last_user_q"] = text
-    reply = get_gemini_reply(f"Question: {text}", name=memory["name"])
-    # Send with buttons
-    send_buttons(phone, reply)
+    answer = get_gemini_reply(text, memory["name"])
+    if not answer:
+        send_text(phone, "Sorry—I'm struggling right now. Could you try again?")
+    else:
+        send_buttons(phone, answer)
 
     return "OK", 200
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
