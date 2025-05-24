@@ -18,11 +18,12 @@ model = genai.GenerativeModel("gemini-1.5-pro-002")
 
 # --- System instruction for StudyMate AI ---
 SYSTEM_PROMPT = (
-    "You are StudyMate AI, a passionate, enthusiastic academic tutor on WhatsApp. "
-    "Do NOT start responses with greetings like 'hi' or 'hello'. "
-    "Give concise replies when casual, but detailed, step-by-step explanations for study queries. "
-    "Offer encouragement and examples. Never mention you're an AI model. "
-    "After instructional replies, ask 'Did that make sense to you?' "
+    "You are StudyMate AI, founded by ByteWave Media, an enthusiastic academic tutor on WhatsApp. "
+    "Never start responses with greetings like 'hi' or 'hello'. "
+    "When a user asks a study-related question, provide a clear, step-by-step solution, detailed examples, and encouragement. "
+    "At the end of educational explanations, ask 'Did that make sense to you?' and expect a button response. "
+    "For casual or non-study chats, reply concisely without adding 'Did that make sense?'. "
+    "Do not mention that you are an AI model or technical implementation details."
 )
 
 # --- Ensure memory directory exists ---
@@ -42,7 +43,7 @@ def save_user_memory(phone, data):
     with open(path, "w") as f:
         json.dump(data, f)
 
-# --- Name question detection ---
+# --- Name detection ---
 def is_name_question(text):
     q = text.lower()
     return any(phrase in q for phrase in [
@@ -55,31 +56,20 @@ def build_tutor_prompt(user_name, user_text):
         SYSTEM_PROMPT + "\n---\n"
         f"Student Name: {user_name}\n"
         f"User Query: {user_text}\n---\n"
-        "Answer:"  # Model completes here
+        "Solution:"  # Model completes here
     )
 
-# --- Send WhatsApp text message ---
+# --- WhatsApp messaging helpers ---
 def send_whatsapp_message(phone, text):
     url = f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages"
-    headers = {
-        "Authorization": f"Bearer {ACCESS_TOKEN}",
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": phone,
-        "type": "text",
-        "text": {"body": text}
-    }
+    headers = {"Authorization": f"Bearer {ACCESS_TOKEN}", "Content-Type": "application/json"}
+    payload = {"messaging_product": "whatsapp", "to": phone, "type": "text", "text": {"body": text}}
     requests.post(url, headers=headers, json=payload)
 
-# --- Send WhatsApp interactive buttons ---
+# --- Send interactive buttons ---
 def send_whatsapp_buttons(phone, text):
     url = f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages"
-    headers = {
-        "Authorization": f"Bearer {ACCESS_TOKEN}",
-        "Content-Type": "application/json"
-    }
+    headers = {"Authorization": f"Bearer {ACCESS_TOKEN}", "Content-Type": "application/json"}
     payload = {
         "messaging_product": "whatsapp",
         "to": phone,
@@ -88,8 +78,8 @@ def send_whatsapp_buttons(phone, text):
             "type": "button",
             "body": {"text": text},
             "action": {"buttons": [
-                {"type": "reply", "reply": {"id": "yes", "title": "✅ Yes"}},
-                {"type": "reply", "reply": {"id": "not_yet", "title": "❓ Not yet"}}
+                {"type": "reply", "reply": {"id": "understood", "title": "Understood"}},
+                {"type": "reply", "reply": {"id": "explain_more", "title": "Explain more"}}
             ]}
         }
     }
@@ -119,36 +109,37 @@ def webhook():
         memory = load_user_memory(phone)
         name = memory.get("name")
 
-        # Onboarding: get full name
+        # Onboarding: ask for full name
         if not name:
+            # user entering name
             if len(text.split()) >= 2 and text.replace(" ", "").isalpha():
                 memory["name"] = text
                 save_user_memory(phone, memory)
-                send_whatsapp_message(phone, f"Great, {text.split()[0]}! Ready to dive into your studies? 📚")
+                send_whatsapp_message(phone, f"Sweet, thanks {text.split()[0]}! What would you like to study today?")
             else:
-                send_whatsapp_message(phone, "Please provide your *full name* (first and last) so I can personalize your sessions.")
+                send_whatsapp_message(phone, "Hey! Could you share your full name (first and last) so I know what to call you?")
             return "OK", 200
 
-        # If user asks their name or identity
+        # Identity check
         if is_name_question(text):
-            send_whatsapp_message(phone, f"You are {name}! 😊 Let's keep learning.")
+            send_whatsapp_message(phone, f"Of course – you are {name}! Ready to continue? 😊")
             return "OK", 200
 
-        # Thinking indicator
+        # Send thinking placeholder
         send_whatsapp_message(phone, "🤖 Thinking...")
 
-        # Build and send AI response
+        # Build prompt and get solution
         prompt = build_tutor_prompt(name, text)
         response = model.generate_content(prompt)
         reply = response.text.strip()
 
-        # Strip leading greetings
-        reply = reply.lstrip('Hi').lstrip('Hello').lstrip('Hey').strip()
+        # Remove any unintended greeting from model
+        reply = reply.lstrip().lstrip('Hi,').lstrip('Hello,').lstrip('Hey,').strip()
 
-        # If reply ends with check, use buttons
-        if reply.endswith("Did that make sense to you? ✅ Yes or ❓ Not yet?"):
-            core = reply.replace("Did that make sense to you? ✅ Yes or ❓ Not yet?", "").strip()
-            send_whatsapp_buttons(phone, core)
+        # Determine if this is an educational explanation requiring check
+        if 'Did that make sense to you?' in reply:
+            core_text = reply.replace('Did that make sense to you?', '').strip()
+            send_whatsapp_buttons(phone, core_text)
         else:
             send_whatsapp_message(phone, reply)
 
