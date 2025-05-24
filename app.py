@@ -19,10 +19,9 @@ model = genai.GenerativeModel("gemini-1.5-pro-002")
 # --- System prompt for StudyMate AI ---
 SYSTEM_PROMPT = (
     "You are StudyMate AI, founded by ByteWave Media, an enthusiastic academic tutor on WhatsApp. "
-    "Never start responses with greetings. "
-    "Provide detailed, step-by-step solutions and examples for study questions, followed by 'Did that make sense to you?' as a button prompt. "
-    "For non-study chat, reply concisely without adding a check prompt. "
-    "Do not mention technical details or that you are an AI."
+    "Never start with a greeting. Maintain context of the conversation and provide accurate, step-by-step educational answers when asked study questions. "
+    "For non-study messages, reply concisely. "
+    "Do not mention you're an AI or technical details."
 )
 
 # --- Ensure memory directory ---
@@ -30,48 +29,41 @@ if not os.path.exists("memory"):
     os.makedirs("memory")
 
 # --- Memory helpers ---
-def load_user_memory(phone):
+def load_memory(phone):
     path = f"memory/{phone}.json"
     if os.path.exists(path):
         with open(path) as f:
             return json.load(f)
-    return {}
+    return {"history": []}
 
 
-def save_user_memory(phone, data):
+def save_memory(phone, data):
     path = f"memory/{phone}.json"
     with open(path, "w") as f:
         json.dump(data, f)
 
-# --- Question type detection ---
+# --- Check types ---
 def is_name_question(text):
     q = text.lower()
-    return any(phrase in q for phrase in [
-        "what's my name", "whats my name", "what is my name", "who am i"
-    ])
+    return any(phrase in q for phrase in ["what's my name", "whats my name", "who am i"])
 
-
-def is_founder_question(text):
-    return "found" in text.lower() or "bytewave" in text.lower()
-
-# --- Build prompt for tutor ---
-def build_tutor_prompt(user_name, user_text):
+# --- Build prompt including history ---
+def build_prompt(user_name, history, user_text):
+    convo = "".join([f"Student: {h['user']}\nTutor: {h.get('bot','')}\n" for h in history[-4:]])
     return (
-        SYSTEM_PROMPT + "\n---\n"
-        f"Student Name: {user_name}\n"
-        f"User Query: {user_text}\n---\n"
-        "Solution:"  # model completes here
+        SYSTEM_PROMPT + "\n--- Conversation so far: ---\n" + convo +
+        f"Student: {user_text}\nTutor:"
     )
 
-# --- WhatsApp send helpers ---
-def send_whatsapp_message(phone, text):
+# --- WhatsApp helpers ---
+def send_text(phone, text):
     url = f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages"
     headers = {"Authorization": f"Bearer {ACCESS_TOKEN}", "Content-Type": "application/json"}
-    payload = {"messaging_product": "whatsapp", "to": phone, "type": "text", "text": {"body": text}}
+    payload = {"messaging_product":"whatsapp","to":phone,"type":"text","text":{"body":text}}
     requests.post(url, headers=headers, json=payload)
 
 
-def send_whatsapp_buttons(phone, text):
+def send_buttons(phone, text):
     url = f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages"
     headers = {"Authorization": f"Bearer {ACCESS_TOKEN}", "Content-Type": "application/json"}
     payload = {
@@ -90,75 +82,70 @@ def send_whatsapp_buttons(phone, text):
     requests.post(url, headers=headers, json=payload)
 
 # --- Webhook endpoint ---
-@app.route("/webhook", methods=["GET", "POST"])
+@app.route("/webhook", methods=["GET","POST"])
 def webhook():
     if request.method == "GET":
-        if request.args.get("hub.verify_token") == VERIFY_TOKEN:
-            return request.args.get("hub.challenge"), 200
-        return "Verification failed", 403
+        if request.args.get("hub.verify_token")==VERIFY_TOKEN:
+            return request.args.get("hub.challenge"),200
+        return "Verification failed",403
 
     data = request.json
     try:
         change = data["entry"][0]["changes"][0]["value"]
-        messages = change.get("messages") or []
-        if not messages:
-            return "OK", 200
+        msgs = change.get("messages") or []
+        if not msgs:
+            return "OK",200
 
-        msg = messages[0]
+        msg = msgs[0]
         phone = msg.get("from")
-        text = msg.get("text", {}).get("body", "").strip()
+        text = msg.get("text",{}).get("body","").strip()
         if not phone or not text:
-            return "OK", 200
+            return "OK",200
 
-        # Load memory
-        memory = load_user_memory(phone)
-        name = memory.get("name")
+        mem = load_memory(phone)
+        name = mem.get("name")
+        history = mem.get("history", [])
 
-        # Onboarding: ask for full name with friendly tone
+        # Onboarding name
         if not name:
-            if len(text.split()) >= 2 and text.replace(" ", "").isalpha():
-                memory["name"] = text
-                save_user_memory(phone, memory)
-                send_whatsapp_message(phone, f"Nice! I’ll call you {text.split()[0]}. What would you like to study today?")
+            if len(text.split())>=2 and text.replace(" ","").isalpha():
+                mem["name"] = text
+                save_memory(phone,mem)
+                send_text(phone, f"Great! I'll call you {text.split()[0]}. What do you want to study today?")
             else:
-                send_whatsapp_message(phone, "Hey there! Could you share your full name (first and last) so I know what to call you?")
-            return "OK", 200
+                send_text(phone, "Hey! What's your full name so I know what to call you?")
+            return "OK",200
 
-        # Handle identity questions
+        # Identity check
         if is_name_question(text):
-            send_whatsapp_message(phone, f"You’re {name}! Let's keep going 👍")
-            return "OK", 200
+            send_text(phone, f"You're {name}! Let's continue.")
+            return "OK",200
 
-        # Handle founder questions
-        if is_founder_question(text):
-            send_whatsapp_message(phone, "StudyMate AI was founded by ByteWave Media to make learning fun and effective! 😃")
-            return "OK", 200
+        # Build AI response
+        prompt = build_prompt(name, history, text)
+        res = model.generate_content(prompt)
+        reply = res.text.strip()
 
-        # Thinking indicator
-        send_whatsapp_message(phone, "🤖 Thinking...")
+        # Clean reply
+        for g in ["Hi,","Hello,","Hey,"]:
+            if reply.startswith(g): reply=reply[len(g):].strip()
 
-        # Generate tutor response
-        prompt = build_tutor_prompt(name, text)
-        response = model.generate_content(prompt)
-        reply = response.text.strip()
+        # Update history
+        history.append({"user":text, "bot":reply})
+        mem["history"] = history[-20:]
+        save_memory(phone, mem)
 
-        # Strip any leading greetings
-        for g in ["hi,", "hello,", "hey,"]:
-            if reply.lower().startswith(g):
-                reply = reply[len(g):].strip()
-
-        # Determine if multi-sentence => educational
-        sentences = [s for s in reply.split('.') if s.strip()]
-        if len(sentences) > 1:
-            # send solution and then buttons
-            send_whatsapp_message(phone, reply)
-            send_whatsapp_buttons(phone, "Did that make sense to you?")
+        # Decide interactivity
+        # if explanation (multiple sentences)
+        if '.' in reply and len(reply.split('.'))>1:
+            send_text(phone, reply)
+            send_buttons(phone, "Did that make sense to you?")
         else:
-            send_whatsapp_message(phone, reply)
+            send_text(phone, reply)
 
     except Exception as e:
-        print("Error handling message:", e)
-    return "OK", 200
+        print("Error:",e)
+    return "OK",200
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
+if __name__=="__main__":
+    app.run(host="0.0.0.0",port=10000)
