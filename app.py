@@ -16,7 +16,7 @@ PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID", "")
 GEMINI_API_KEY  = os.getenv("GEMINI_API_KEY",  "")
 
 genai.configure(api_key=GEMINI_API_KEY)
-MODEL_ID = "models/chat-bison-001"    # or your preferred Gemini model
+MODEL_ID = "models/chat-bison-001"    # or your chosen Gemini model
 
 MEMORY_DIR = "memory"
 os.makedirs(MEMORY_DIR, exist_ok=True)
@@ -74,7 +74,7 @@ def send_buttons(to: str, text: str, options: list[str]):
     send_whatsapp(payload)
 
 def download_media(media_id: str) -> str:
-    # 1) fetch media URL
+    # 1) fetch media metadata to get URL
     meta = requests.get(
         f"https://graph.facebook.com/v17.0/{media_id}",
         headers={"Authorization": f"Bearer {ACCESS_TOKEN}"}
@@ -82,7 +82,7 @@ def download_media(media_id: str) -> str:
     url = meta.get("url")
     if not url:
         raise RuntimeError("Could not fetch media URL")
-    # 2) download content
+    # 2) download the file
     r = requests.get(url, headers={"Authorization": f"Bearer {ACCESS_TOKEN}"})
     r.raise_for_status()
     ext = ".pdf" if meta.get("mime_type","").startswith("application") else ".jpg"
@@ -102,6 +102,7 @@ def parse_pdf(path: str) -> str:
 
 def parse_image(path: str) -> str:
     try:
+        import pytesseract
         return pytesseract.image_to_string(Image.open(path))
     except Exception:
         return ""
@@ -128,18 +129,16 @@ def webhook():
     # ── STEP 1: NAME MEMORY ─────────────────────────────────────────────────────
 
     if "name" not in mem:
-        # ask once
         if not mem.get("awaiting_name"):
             mem["awaiting_name"] = True
             save_memory(user_id, mem)
             send_buttons(
                 user_id,
-                "Hey! Before we start, could I have your full name so I can save you in my contacts?",
+                "Hey there! 😊 Could I grab your full name so I can save you in my contacts?",
                 ["Sure!"]
             )
             return "OK", 200
 
-        # save name on next text
         if mem.get("awaiting_name") and mtype == "text":
             full_name = msg["text"]["body"].strip()
             mem["name"] = full_name
@@ -189,23 +188,21 @@ def webhook():
         text_in = msg["text"]["body"].strip()
         lower = text_in.lower()
 
-        # narrow down broad subjects
         samples = {
-            "english":    ["grammar rules", "essay structure", "vocabulary", "comprehension"],
-            "chemistry":  ["periodic table", "stoichiometry", "bonding", "thermodynamics"],
-            "math":       ["algebra", "calculus", "geometry", "statistics"],
-            "history":    ["WWII", "renaissance", "cold war", "ancient empires"],
+            "english":    ["grammar rules", "essay structure", "vocabulary"],
+            "chemistry":  ["periodic table", "stoichiometry", "bonding"],
+            "math":       ["algebra", "calculus", "geometry"],
+            "history":    ["WWII", "renaissance", "ancient empires"],
         }
         if lower in samples:
-            opts = samples[lower][:3]
+            opts = samples[lower]
             send_text(
                 user_id,
-                f"Great, {text_in.capitalize()} is vast—what specifically?  
-For example: {', '.join(opts)}."
+                f"Great, {text_in.capitalize()} is vast—what specifically? For example: {', '.join(opts)}."
             )
             return "OK", 200
 
-        # academic Q&A triggers
+        # Academic‐style Q&A
         if len(text_in.split()) > 3 or "solve" in lower:
             mem["last_academic_prompt"] = text_in
             save_memory(user_id, mem)
@@ -213,13 +210,13 @@ For example: {', '.join(opts)}."
             send_buttons(user_id, ans, ["Understood", "Explain More"])
             return "OK", 200
 
-        # casual fallback
+        # Casual fallback
         ans = call_gemini(text_in)
         send_text(user_id, ans)
         return "OK", 200
 
-    # unknown type
-    send_text(user_id, "Sorry, I didn't get that. Could you rephrase?")
+    # Unknown
+    send_text(user_id, "Sorry, I didn't catch that. Could you rephrase?")
     return "OK", 200
 
 
