@@ -69,7 +69,6 @@ def send_text(to: str, body: str):
     })
 
 def send_buttons(to: str, text: str, options: list[str]):
-    # buttons payload IDs must be lowercase, no spaces
     buttons = []
     for opt in options:
         bid = opt.lower().replace(" ", "_")
@@ -89,21 +88,16 @@ def send_buttons(to: str, text: str, options: list[str]):
 # ── MEDIA HANDLING ────────────────────────────────────────────────────────────
 
 def download_media(media_id: str) -> str:
-    # 1) fetch the media URL
     meta = requests.get(
-        f"https://graph.facebook.com/v17.0/{media_id}?fields=url",
-        params={"access_token": ACCESS_TOKEN}
+        f"https://graph.facebook.com/v17.0/{media_id}",
+        params={"fields": "url,mime_type", "access_token": ACCESS_TOKEN}
     ).json()
     url = meta.get("url")
     if not url:
         raise RuntimeError("Could not fetch media URL")
-
-    # 2) download the file bytes
     r = requests.get(url, params={"access_token": ACCESS_TOKEN})
     r.raise_for_status()
-
-    # choose extension
-    ext = ".pdf" if "application" in meta.get("mime_type", "") else ".jpg"
+    ext = ".pdf" if meta.get("mime_type", "").startswith("application") else ".jpg"
     path = os.path.join(tempfile.gettempdir(), f"{media_id}{ext}")
     with open(path, "wb") as f:
         f.write(r.content)
@@ -137,7 +131,12 @@ def webhook():
             return request.args["hub.challenge"], 200
         return "Forbidden", 403
 
-    data = request.json
+    data = request.json or {}
+    # guard non-message events
+    if "contacts" not in data or "messages" not in data:
+        logging.info("Webhook received non-message event.")
+        return "OK", 200
+
     contact = data["contacts"][0]
     user_id = contact["wa_id"]
     mem = load_memory(user_id)
@@ -147,28 +146,25 @@ def webhook():
 
     # ── STEP 1: ASK FOR FULL NAME ────────────────────────────────────────────────
     if "name" not in mem:
-        # first time prompt
         if not mem.get("awaiting_name"):
             mem["awaiting_name"] = True
             save_memory(user_id, mem)
-            # friendly variants can be randomized if desired
-            send_text(user_id, "Hey! What's your full name so I can save you nicely in my contacts?")
+            send_text(user_id, "Hey! What's your **full name** so I can save you nicely in my contacts?")
             return "OK", 200
 
-        # capture their reply as name
         if mem.get("awaiting_name") and mtype == "text":
             full = msg["text"]["body"].strip()
             mem["name"] = full
             mem.pop("awaiting_name")
             save_memory(user_id, mem)
-            send_text(user_id, f"Awesome, {full}! You're now in my contacts. What topic shall we tackle first?")
+            send_text(user_id, f"Great, {full}! You're all set. What topic shall we tackle first?")
             return "OK", 200
 
     # ── BUTTON RESPONSE HANDLING ─────────────────────────────────────────────────
     if mtype == "button":
         payload = msg["button"]["payload"]
         if payload == "understood":
-            send_text(user_id, "Great! 👍 What's next?")
+            send_text(user_id, "Awesome! 👍 What would you like next?")
             return "OK", 200
         if payload == "explain_more":
             prompt = mem.get("last_academic_prompt", "")
@@ -202,7 +198,6 @@ def webhook():
         text_in = msg["text"]["body"].strip()
         lower = text_in.lower()
 
-        # common-course suggestions
         samples = {
             "english":    ["grammar rules", "essay structure", "vocabulary"],
             "chemistry":  ["periodic table", "stoichiometry", "chemical bonding"],
@@ -217,7 +212,7 @@ def webhook():
             )
             return "OK", 200
 
-        # academic Q&A (longer queries or solve requests)
+        # academic Q&A
         if len(text_in) > 30 or "solve" in lower:
             mem["last_academic_prompt"] = text_in
             save_memory(user_id, mem)
@@ -225,7 +220,7 @@ def webhook():
             send_buttons(user_id, ans, ["Understood", "Explain More"])
             return "OK", 200
 
-        # fallback: simple chat
+        # fallback small talk
         ans = call_gemini(text_in)
         send_text(user_id, ans)
         return "OK", 200
