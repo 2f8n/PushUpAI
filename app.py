@@ -5,10 +5,17 @@ import logging
 
 import requests
 import pdfplumber
-from PIL import Image
-import google.generativeai as genai
+from flask import Flask, request, abort
 
-from flask import Flask, request
+# Optional OCR:
+try:
+    from PIL import Image
+    import pytesseract
+    OCR_AVAILABLE = True
+except ImportError:
+    OCR_AVAILABLE = False
+
+import google.generativeai as genai
 
 # ── CONFIG ─────────────────────────────────────────────────────────────────────
 
@@ -40,7 +47,7 @@ def save_memory(user_id: str, mem: dict):
         json.dump(mem, f)
 
 
-# ── GEMINI ─────────────────────────────────────────────────────────────────────
+# ── GEMINI CALL ─────────────────────────────────────────────────────────────────
 
 def call_gemini(prompt: str) -> str:
     resp = genai.chat.create(
@@ -50,7 +57,7 @@ def call_gemini(prompt: str) -> str:
     return resp.choices[0].message.content.strip()
 
 
-# ── WHATSAPP SENDING ──────────────────────────────────────────────────────────
+# ── WHATSAPP SENDER ────────────────────────────────────────────────────────────
 
 def send_whatsapp(payload: dict):
     url = f"https://graph.facebook.com/v17.0/{PHONE_NUMBER_ID}/messages"
@@ -88,6 +95,7 @@ def send_buttons(to: str, text: str, options: list[str]):
 # ── MEDIA PARSING ──────────────────────────────────────────────────────────────
 
 def download_media(media_id: str) -> str:
+    # 1) fetch URL + mime_type
     meta = requests.get(
         f"https://graph.facebook.com/v17.0/{media_id}",
         params={"fields": "url,mime_type", "access_token": ACCESS_TOKEN}
@@ -95,6 +103,7 @@ def download_media(media_id: str) -> str:
     url = meta.get("url")
     if not url:
         raise RuntimeError("Could not fetch media URL")
+    # 2) download with token
     r = requests.get(url, params={"access_token": ACCESS_TOKEN})
     r.raise_for_status()
     ext = ".pdf" if meta.get("mime_type","").startswith("application") else ".jpg"
@@ -113,8 +122,9 @@ def parse_pdf(path: str) -> str:
     return "\n".join(text_pages)
 
 def parse_image(path: str) -> str:
+    if not OCR_AVAILABLE:
+        return ""
     try:
-        import pytesseract
         return pytesseract.image_to_string(Image.open(path))
     except Exception:
         return ""
@@ -125,26 +135,26 @@ def parse_image(path: str) -> str:
 @app.route("/webhook", methods=["GET", "POST"])
 def webhook():
     if request.method == "GET":
-        # verification challenge
+        # Verification handshake
         if request.args.get("hub.mode") == "subscribe" \
         and request.args.get("hub.verify_token") == VERIFY_TOKEN:
             return request.args["hub.challenge"], 200
         return "Forbidden", 403
 
-    # unwrap the real payload
-    body = request.get_json(force=True)
-    entry = body.get("entry", [])
+    data = request.get_json(force=True)
+    entry = data.get("entry", [])
     if not entry:
-        logging.info("No entry in payload")
+        logging.info("No entry")
         return "OK", 200
+
     changes = entry[0].get("changes", [])
     if not changes:
-        logging.info("No changes in payload")
+        logging.info("No changes")
         return "OK", 200
+
     value = changes[0].get("value", {})
-    # now guard non‐message events
     if "contacts" not in value or "messages" not in value:
-        logging.info("Webhook received non-message event.")
+        logging.info("Non-message event")
         return "OK", 200
 
     contacts = value["contacts"]
@@ -154,51 +164,50 @@ def webhook():
     msg = messages[0]
     mtype = msg["type"]
 
-    # ── STEP 1: NAME COLLECTION ──────────────────────────────────────────────
+    # ─── STEP 1: NAME COLLECTION ────────────────────────────────────────────────
     if "name" not in mem:
         if not mem.get("awaiting_name"):
             mem["awaiting_name"] = True
             save_memory(to_user, mem)
             send_text(
                 to_user,
-                "Hey there! What's your full name so I can save you nicely in my contacts?"
+                "👋 Hey! What's your full name so I can save you nicely in my contacts?"
             )
             return "OK", 200
 
-        # collect the name
+        # capture their name
         if mem.get("awaiting_name") and mtype == "text":
             full = msg["text"]["body"].strip()
             mem["name"] = full
             mem.pop("awaiting_name", None)
             save_memory(to_user, mem)
-            send_text(to_user, f"Awesome, {full}! What topic shall we dive into first?")
+            send_text(to_user, f"Thanks, {full}! What topic shall we dive into first?")
             return "OK", 200
 
-    # ── BUTTON HANDLING ────────────────────────────────────────────────────────
+    # ─── BUTTON REPLIES ─────────────────────────────────────────────────────────
     if mtype == "button":
         payload = msg["button"]["payload"]
         if payload == "understood":
-            send_text(to_user, "Great! 👍 What would you like to tackle next?")
+            send_text(to_user, "👍 Great! What next?")
             return "OK", 200
         if payload == "explain_more":
             prompt = mem.get("last_academic_prompt", "")
-            reply = call_gemini(prompt) if prompt else "Could you clarify what you'd like more on?"
+            reply = call_gemini(prompt) if prompt else "Sure—what exactly?"
             send_buttons(to_user, reply, ["Understood", "Explain More"])
             return "OK", 200
 
-    # ── FILE / IMAGE ───────────────────────────────────────────────────────────
+    # ─── MEDIA (PDF/IMAGE) ──────────────────────────────────────────────────────
     if mtype in ("document", "image"):
-        media = msg[mtype]
-        mid = media["id"]
+        mid = msg[mtype]["id"]
         try:
             path = download_media(mid)
         except Exception:
-            send_text(to_user, "Oops—I couldn’t download that. Please try again.")
+            send_text(to_user, "😕 Couldn’t download that file. Try again?")
             return "OK", 200
 
         text = parse_pdf(path) if mtype=="document" else parse_image(path)
         if not text.strip():
-            send_text(to_user, "Got it, but couldn’t extract text. Try a clearer file?")
+            send_text(to_user, "I got it but couldn’t read any text.")
             return "OK", 200
 
         mem["last_academic_prompt"] = text
@@ -207,12 +216,11 @@ def webhook():
         send_buttons(to_user, ans, ["Understood", "Explain More"])
         return "OK", 200
 
-    # ── BROAD TOPIC PROMPT ─────────────────────────────────────────────────────
+    # ─── TEXT: BROAD TOPIC EXAMPLES ─────────────────────────────────────────────
     if mtype == "text":
         text_in = msg["text"]["body"].strip()
         lower = text_in.lower()
 
-        # examples for common courses
         samples = {
             "english":   ["grammar rules", "essay structure", "vocabulary"],
             "chemistry": ["periodic table", "stoichiometry", "bonding"],
@@ -224,11 +232,12 @@ def webhook():
             name = mem.get("name", "Hey")
             send_text(
                 to_user,
-                f"{name}, {text_in.capitalize()} is huge—what specifically?  For example: {', '.join(opts)}."
+                f"{name}, {text_in.capitalize()} is huge—what specifically? "
+                f"For example: {', '.join(opts)}."
             )
             return "OK", 200
 
-        # treat longer or “solve” questions as academic
+        # long/“solve” questions → academic flow
         if len(text_in) > 30 or "solve" in lower:
             mem["last_academic_prompt"] = text_in
             save_memory(to_user, mem)
@@ -236,15 +245,15 @@ def webhook():
             send_buttons(to_user, ans, ["Understood", "Explain More"])
             return "OK", 200
 
-        # fallback: small talk
+        # fallback small talk
         ans = call_gemini(text_in)
         send_text(to_user, ans)
         return "OK", 200
 
-    # ── CATCH‐ALL ──────────────────────────────────────────────────────────────
-    send_text(to_user, "Sorry, I didn’t catch that—could you rephrase?")
+    # ─── CATCH-ALL ──────────────────────────────────────────────────────────────
+    send_text(to_user, "Sorry—I didn’t catch that. Could you rephrase?")
     return "OK", 200
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=True)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=True)
