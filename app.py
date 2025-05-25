@@ -1,270 +1,227 @@
-# File: app.py
-
-from flask import Flask, request
-import os, json, random, requests, pdfplumber
+import os
+import json
+import tempfile
+import requests
+import pdfplumber
 from PIL import Image
 import google.generativeai as genai
-from pytesseract import pytesseract, TesseractNotFoundError
+from flask import Flask, request
 
 app = Flask(__name__)
 
-# ─── Configuration ────────────────────────────────────────────────────────
-VERIFY_TOKEN    = os.getenv("VERIFY_TOKEN", "pushupai_verify_token")
-ACCESS_TOKEN    = os.getenv("ACCESS_TOKEN", "")
+# ── CONFIG ─────────────────────────────────────────────────────────────────────
+VERIFY_TOKEN    = os.getenv("VERIFY_TOKEN",    "your_verify_token")
+ACCESS_TOKEN    = os.getenv("ACCESS_TOKEN",    "")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID", "")
-GEMINI_API_KEY  = os.getenv("GEMINI_API_KEY", "")
-MODEL_NAME      = "models/gemini-pro"        # update if yours is different
+GEMINI_API_KEY  = os.getenv("GEMINI_API_KEY",  "")
 
-# Initialize Gemini
 genai.configure(api_key=GEMINI_API_KEY)
+MODEL_ID = "models/chat-bison-001"    # or your preferred Gemini model
 
-# ─── Memory Helpers ──────────────────────────────────────────────────────
-def mem_path(phone): return f"memory/{phone}.json"
-def load_mem(phone):
-    try:
-        return json.load(open(mem_path(phone)))
-    except FileNotFoundError:
-        return {}
-def save_mem(phone, data):
-    os.makedirs("memory", exist_ok=True)
-    json.dump(data, open(mem_path(phone),"w"))
+MEMORY_DIR = "memory"
+os.makedirs(MEMORY_DIR, exist_ok=True)
 
-# ephemeral per-chat state
-user_states = {}
 
-# ─── WhatsApp Send Helpers ───────────────────────────────────────────────
-def send_text(phone, text):
-    payload = {
-        "messaging_product":"whatsapp","to":phone,
-        "type":"text","text":{"body":text}
-    }
-    headers = {"Authorization":f"Bearer {ACCESS_TOKEN}"}
-    r = requests.post(
-        f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages",
-        headers=headers, json=payload
+# ── HELPERS ────────────────────────────────────────────────────────────────────
+
+def load_memory(user_id):
+    path = os.path.join(MEMORY_DIR, f"{user_id}.json")
+    if os.path.isfile(path):
+        return json.load(open(path))
+    return {}
+
+def save_memory(user_id, mem):
+    with open(os.path.join(MEMORY_DIR, f"{user_id}.json"), "w") as f:
+        json.dump(mem, f)
+
+def call_gemini(prompt: str) -> str:
+    resp = genai.chat.create(
+        model=MODEL_ID,
+        messages=[{"author": "user", "content": prompt}],
     )
-    print("→ text", r.status_code, r.text)
+    return resp.choices[0].message.content.strip()
 
-def send_buttons(phone, text, two_buttons=True):
-    """
-    two_buttons=True: ["Understood","Explain more"]
-    two_buttons=False: a single ["Explain more"]
-    """
-    btns = []
-    if two_buttons:
-        btns = [
-            {"type":"reply","reply":{"id":"understood","title":"Understood"}},
-            {"type":"reply","reply":{"id":"explain_more","title":"Explain more"}}
-        ]
-    else:
-        btns = [
-            {"type":"reply","reply":{"id":"explain_more","title":"Explain more"}}
-        ]
+def send_whatsapp(payload: dict):
+    url = f"https://graph.facebook.com/v17.0/{PHONE_NUMBER_ID}/messages"
+    headers = {"Authorization": f"Bearer {ACCESS_TOKEN}"}
+    r = requests.post(url, headers=headers, json=payload)
+    r.raise_for_status()
 
+def send_text(to: str, body: str):
     payload = {
-      "messaging_product":"whatsapp","to":phone,
-      "type":"interactive",
-      "interactive":{
-        "type":"button",
-        "body":{"text": text[:1024] or " "}
-        ,
-        "action":{"buttons":btns}
-      }
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "text",
+        "text": {"body": body}
     }
-    headers = {"Authorization":f"Bearer {ACCESS_TOKEN}"}
-    r = requests.post(
-      f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages",
-      headers=headers, json=payload
-    )
-    print("→ buttons", r.status_code, r.text)
+    send_whatsapp(payload)
 
-# ─── Media Download & Parsing ─────────────────────────────────────────────
-def download_media(media_id, filename):
-    # 1) fetch URL
+def send_buttons(to: str, text: str, options: list[str]):
+    buttons = [{
+        "type": "reply",
+        "reply": {"id": opt.lower(), "title": opt}
+    } for opt in options]
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "interactive",
+        "interactive": {
+            "type": "button",
+            "body": {"text": text},
+            "action": {"buttons": buttons}
+        }
+    }
+    send_whatsapp(payload)
+
+def download_media(media_id: str) -> str:
+    # 1) fetch media URL
     meta = requests.get(
-        f"https://graph.facebook.com/v19.0/{media_id}",
-        params={"fields":"url"},
-        headers={"Authorization":f"Bearer {ACCESS_TOKEN}"}
+        f"https://graph.facebook.com/v17.0/{media_id}",
+        headers={"Authorization": f"Bearer {ACCESS_TOKEN}"}
     ).json()
     url = meta.get("url")
     if not url:
-        raise Exception("no media url")
-    # 2) download
-    data = requests.get(url).content
-    os.makedirs(os.path.dirname(filename), exist_ok=True)
-    open(filename,"wb").write(data)
-    return filename
+        raise RuntimeError("Could not fetch media URL")
+    # 2) download content
+    r = requests.get(url, headers={"Authorization": f"Bearer {ACCESS_TOKEN}"})
+    r.raise_for_status()
+    ext = ".pdf" if meta.get("mime_type","").startswith("application") else ".jpg"
+    path = os.path.join(tempfile.gettempdir(), f"{media_id}{ext}")
+    with open(path, "wb") as f:
+        f.write(r.content)
+    return path
 
-def parse_pdf(path):
+def parse_pdf(path: str) -> str:
     text = []
     with pdfplumber.open(path) as pdf:
         for p in pdf.pages:
-            text.append(p.extract_text() or "")
+            t = p.extract_text()
+            if t:
+                text.append(t)
     return "\n".join(text)
 
-def parse_image(path):
-    return pytesseract.image_to_string(Image.open(path))
-
-# ─── Gemini Wrapper ──────────────────────────────────────────────────────
-def get_reply(prompt, first_name):
-    system = f"""
-You are StudyMate AI, an empathetic tutor.  
-Use the student’s first name ({first_name}) only once, and never at the start of every message—start directly.  
-Be concise unless detail is required.  
-If a question is ambiguous, ask one clarifying question.  
-If asked “Who are you?”, reply “I’m StudyMate AI by ByteWave Media.”"""
+def parse_image(path: str) -> str:
     try:
-        r = genai.GenerativeModel(MODEL_NAME).generate_content(
-            system + "\n\nStudent: " + prompt
-        )
-        return r.text.strip()
-    except Exception as e:
-        print("Gemini error:", e)
-        return "Sorry, I’m having trouble right now—try again soon."
+        return pytesseract.image_to_string(Image.open(path))
+    except Exception:
+        return ""
 
-# ─── Predefined sub-topics for broad categories ───────────────────────────
-EXAMPLES = {
-    "grammar": ["Punctuation","Sentence Structure","Tenses","Parts of Speech"],
-    "english": ["Essay Writing","Literature Analysis","Vocabulary","Grammar"],
-    "math":    ["Algebra","Geometry","Calculus","Probability"],
-    "chemistry":["Periodic Table","Chemical Bonds","Reactions","Stoichiometry"],
-    # add more as you like...
-}
 
-# ─── Main Webhook ─────────────────────────────────────────────────────────
-@app.route("/webhook", methods=["GET","POST"])
+# ── WEBHOOK ────────────────────────────────────────────────────────────────────
+
+@app.route("/webhook", methods=["GET", "POST"])
 def webhook():
-    if request.method=="GET":
-        if (request.args.get("hub.mode")=="subscribe"
-            and request.args.get("hub.verify_token")==VERIFY_TOKEN):
-            return request.args.get("hub.challenge"), 200
+    if request.method == "GET":
+        if request.args.get("hub.mode") == "subscribe" \
+        and request.args.get("hub.verify_token") == VERIFY_TOKEN:
+            return request.args["hub.challenge"], 200
         return "Verification failed", 403
 
     data = request.json
-    val  = data["entry"][0]["changes"][0]["value"]
-    if "messages" not in val:
-        return "OK", 200
+    contact = data["contacts"][0]
+    user_id = contact["wa_id"]
+    mem = load_memory(user_id)
 
-    msg   = val["messages"][0]
-    phone = msg["from"]
-    mtype = msg.get("type")
-    text  = msg.get("text",{}).get("body","").strip()
+    msg = data["messages"][0]
+    mtype = msg["type"]
 
-    # load memory + state
-    mem = load_mem(phone)
-    user_states.setdefault(phone, {})
+    # ── STEP 1: NAME MEMORY ─────────────────────────────────────────────────────
 
-    # ─── 1) Onboarding → ask full name once ───────────────────────────────
-    if "full_name" not in mem:
-        # if looks like full name
-        if len(text.split()) >= 2:
-            full = text.strip()
-            first = full.split()[0]
-            mem["full_name"]  = full
-            mem["first_name"] = first
-            save_mem(phone, mem)
-            send_text(phone,
-                f"Great, {first}! I’ve saved you in my contacts. What would you like to study first?")
-        else:
-            variants = [
-                "Hey! What’s your full name so I can save you in my contacts?",
-                "Hi there—please send me your full name so I can add you.",
-                "Hello! Drop your full name, and I’ll save it for our chats.",
-                "Nice to meet you! What’s your full name for my contacts?",
-                "Welcome aboard! Could I get your full name to save in my contacts?"
-            ]
-            send_text(phone, random.choice(variants))
-        return "OK", 200
+    if "name" not in mem:
+        # ask once
+        if not mem.get("awaiting_name"):
+            mem["awaiting_name"] = True
+            save_memory(user_id, mem)
+            send_buttons(
+                user_id,
+                "Hey! Before we start, could I have your full name so I can save you in my contacts?",
+                ["Sure!"]
+            )
+            return "OK", 200
 
-    # now we know their name
-    first = mem["first_name"]
+        # save name on next text
+        if mem.get("awaiting_name") and mtype == "text":
+            full_name = msg["text"]["body"].strip()
+            mem["name"] = full_name
+            mem.pop("awaiting_name", None)
+            save_memory(user_id, mem)
+            send_text(user_id, f"Awesome, {full_name}! You're all set in my contacts. What shall we dive into today?")
+            return "OK", 200
 
-    # ─── 2) DOCUMENT upload (PDF) ─────────────────────────────────────────
-    if mtype=="document":
-        doc_id = msg["document"]["id"]
+    # ── STEP 2: BUTTON HANDLES ──────────────────────────────────────────────────
+
+    if mtype == "button":
+        payload = msg["button"]["payload"]
+        if payload == "understood":
+            send_text(user_id, "Great! 👍 What's next?")
+            return "OK", 200
+        if payload == "explain more":
+            prompt = mem.get("last_academic_prompt", "Can you clarify?")
+            ans = call_gemini(prompt)
+            send_buttons(user_id, ans, ["Understood", "Explain More"])
+            return "OK", 200
+
+    # ── STEP 2: FILE / IMAGE HANDLING ──────────────────────────────────────────
+
+    if mtype in ("document", "image"):
+        media = msg[mtype]
+        media_id = media["id"]
         try:
-            path   = download_media(doc_id, f"uploads/{doc_id}.pdf")
-            parsed = parse_pdf(path)
-            user_states[phone]["last_text"] = parsed
-            send_text(phone,
-                "✅ PDF received! Reply *summarize* or *quiz* when ready.")
-        except Exception as e:
-            print("PDF error:", e)
-            send_text(phone,
-                "⚠️ Couldn’t fetch or parse that PDF. Please try again.")
+            path = download_media(media_id)
+        except Exception:
+            send_text(user_id, "Oops, I couldn’t grab that file—please try again.")
+            return "OK", 200
+
+        content = parse_pdf(path) if mtype == "document" else parse_image(path)
+        if not content.strip():
+            send_text(user_id, "I read it, but couldn’t extract any text. Try a clearer PDF or image?")
+            return "OK", 200
+
+        mem["last_academic_prompt"] = content
+        save_memory(user_id, mem)
+        ans = call_gemini(content)
+        send_buttons(user_id, ans, ["Understood", "Explain More"])
         return "OK", 200
 
-    # ─── 3) IMAGE upload ───────────────────────────────────────────────────
-    if mtype=="image":
-        img_id = msg["image"]["id"]
-        try:
-            path = download_media(img_id, f"uploads/{img_id}.jpg")
-            parsed = parse_image(path)
-            user_states[phone]["last_text"] = parsed
-            send_text(phone,
-                "🖼️ Image received! Text extracted. Reply *summarize* or *quiz*.")
-        except TesseractNotFoundError:
-            send_text(phone,
-                "⚠️ OCR not installed on server. Please upload a PDF instead.")
-        except Exception as e:
-            print("IMG error:", e)
-            send_text(phone,
-                "⚠️ Couldn’t process that image. Please try again.")
+    # ── BROAD-TOPIC PROMPTS ─────────────────────────────────────────────────────
+
+    if mtype == "text":
+        text_in = msg["text"]["body"].strip()
+        lower = text_in.lower()
+
+        # narrow down broad subjects
+        samples = {
+            "english":    ["grammar rules", "essay structure", "vocabulary", "comprehension"],
+            "chemistry":  ["periodic table", "stoichiometry", "bonding", "thermodynamics"],
+            "math":       ["algebra", "calculus", "geometry", "statistics"],
+            "history":    ["WWII", "renaissance", "cold war", "ancient empires"],
+        }
+        if lower in samples:
+            opts = samples[lower][:3]
+            send_text(
+                user_id,
+                f"Great, {text_in.capitalize()} is vast—what specifically?  
+For example: {', '.join(opts)}."
+            )
+            return "OK", 200
+
+        # academic Q&A triggers
+        if len(text_in.split()) > 3 or "solve" in lower:
+            mem["last_academic_prompt"] = text_in
+            save_memory(user_id, mem)
+            ans = call_gemini(text_in)
+            send_buttons(user_id, ans, ["Understood", "Explain More"])
+            return "OK", 200
+
+        # casual fallback
+        ans = call_gemini(text_in)
+        send_text(user_id, ans)
         return "OK", 200
 
-    # ─── 4) Summarize / Quiz commands ──────────────────────────────────────
-    cmd = text.lower()
-    if cmd in ("summarize","quiz"):
-        last = user_states[phone].get("last_text","")
-        if not last:
-            send_text(phone,
-                "No file/text loaded yet—please upload a PDF or image first.")
-        else:
-            prompt = ("Summarize this:\n" if cmd=="summarize"
-                      else "Create a 5-question quiz on this:\n") + last
-            ans = get_reply(prompt, first)
-            user_states[phone]["last_user_q"] = prompt
-            send_buttons(phone, ans, two_buttons=True)
-        return "OK", 200
-
-    # ─── 5) Button replies ─────────────────────────────────────────────────
-    if mtype=="interactive" and "button_reply" in msg.get("interactive",{}):
-        bid = msg["interactive"]["button_reply"]["id"]
-        if bid=="understood":
-            send_text(phone, "Awesome—what’s next on your agenda?")
-        elif bid=="explain_more":
-            last = user_states[phone].get("last_user_q")
-            if last:
-                ans = get_reply("Please explain more:\n"+last, first)
-                send_buttons(phone, ans, two_buttons=True)
-            else:
-                send_text(phone, "Sure—what should I explain further?")
-        else:
-            send_text(phone, "Hm, I didn’t catch that—could you rephrase?")
-        return "OK", 200
-
-    # ─── 6) Broad-topic detection ───────────────────────────────────────────
-    subj = text.lower()
-    if subj in EXAMPLES:
-        exs = EXAMPLES[subj][:3]
-        send_text(phone,
-            f"Great choice! What specifically in {subj.title()}? "
-            f"For example: {', '.join(exs)}.")
-        return "OK", 200
-
-    # ─── 7) Free-form Q&A ──────────────────────────────────────────────────
-    if text:
-        ans = get_reply(text, first)
-        # on genuine questions, offer buttons
-        if text.endswith("?"):
-            user_states[phone]["last_user_q"] = text
-            send_buttons(phone, ans, two_buttons=True)
-        else:
-            send_text(phone, ans or
-                "Sorry, I’m not sure—could you clarify?")
-    else:
-        send_text(phone, "I didn’t catch that—what would you like to study?")
+    # unknown type
+    send_text(user_id, "Sorry, I didn't get that. Could you rephrase?")
     return "OK", 200
 
-if __name__=="__main__":
-    app.run(host="0.0.0.0", port=10000)
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=True)
