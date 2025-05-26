@@ -3,7 +3,7 @@
 StudyMate AI: WhatsApp-based academic tutor using Flask, Firebase Firestore, and Google Gemini.
 Features:
 - User onboarding with full-name collection
-- Welcome-back personalized greeting on greetings
+- Personalized welcome-back greeting on greeting keywords
 - Free vs. Premium accounts with 20-prompts/day limit for Free
 - Academic-only Q&A with "Understood"/"Explain more" buttons only after answers
 - Context tracking for elaboration
@@ -18,20 +18,20 @@ from firebase_admin import credentials, firestore
 import google.generativeai as genai
 from datetime import datetime, timedelta
 
-# Initialize Flask
+# ─── Flask App Initialization ─────────────────────────────────────────────────
 app = Flask(__name__)
 
-# Environment variables
+# ─── Environment Variables ──────────────────────────────────────────────────────
 VERIFY_TOKEN    = os.getenv("VERIFY_TOKEN",    "pushupai_verify_token")
 ACCESS_TOKEN    = os.getenv("ACCESS_TOKEN",    "")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID", "")
 GEMINI_API_KEY  = os.getenv("GEMINI_API_KEY",  "")
 
-# Configure Genie (Gemini)
+# ─── Google Gemini Configuration ───────────────────────────────────────────────
 genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel("gemini-1.5-pro-002")
 
-# Initialize Firestore
+# ─── Firebase (Firestore) Initialization ────────────────────────────────────────
 KEY_FILENAME = "studymate-ai-9197f-firebase-adminsdk-fbsvc-5a52d9ff48.json"
 SECRET_PATH = f"/etc/secrets/{KEY_FILENAME}"
 cred_path = SECRET_PATH if os.path.exists(SECRET_PATH) else KEY_FILENAME
@@ -39,8 +39,11 @@ cred = credentials.Certificate(cred_path)
 firebase_admin.initialize_app(cred)
 db = firestore.client()
 
-# Helper: load or create user
+# ─── Helper: Load or Create User ────────────────────────────────────────────────
 def get_or_create_user(phone: str) -> dict:
+    """
+    Retrieve user document or create a new one with default fields.
+    """
     doc_ref = db.collection("users").document(phone)
     doc = doc_ref.get()
     if not doc.exists:
@@ -57,19 +60,24 @@ def get_or_create_user(phone: str) -> dict:
         return user
     return doc.to_dict()
 
-# Helper: update user fields
+# ─── Helper: Update User Fields ─────────────────────────────────────────────────
 def update_user(phone: str, **fields):
+    """
+    Update specified fields for a user document.
+    """
     db.collection("users").document(phone).update(fields)
 
-# Send text message
+# ─── Send Text Message ──────────────────────────────────────────────────────────
 def send_whatsapp_message(phone: str, text: str):
+    """Send a text message via WhatsApp Cloud API."""
     url = f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages"
     headers = {"Authorization": f"Bearer {ACCESS_TOKEN}", "Content-Type": "application/json"}
-    payload = {"messaging_product":"whatsapp","to":phone,"type":"text","text":{"body":text}}
+    payload = {"messaging_product":"whatsapp", "to":phone, "type":"text", "text":{"body":text}}
     requests.post(url, headers=headers, json=payload)
 
-# Send interactive buttons
+# ─── Send Interactive Buttons ───────────────────────────────────────────────────
 def send_interactive_buttons(phone: str):
+    """Send 'Understood'/'Explain more' buttons."""
     url = f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages"
     headers = {"Authorization": f"Bearer {ACCESS_TOKEN}", "Content-Type": "application/json"}
     interactive = {
@@ -80,15 +88,17 @@ def send_interactive_buttons(phone: str):
             {"type":"reply","reply":{"id":"explain_more","title":"Explain more"}}
         ]}
     }
-    payload = {"messaging_product":"whatsapp","to":phone,"type":"interactive","interactive":interactive}
+    payload = {"messaging_product":"whatsapp", "to":phone, "type":"interactive", "interactive":interactive}
     requests.post(url, headers=headers, json=payload)
 
-# Clean leading greetings
+# ─── Strip Leading Greetings ─────────────────────────────────────────────────────
 def strip_greeting(text: str) -> str:
+    """Remove leading greetings like 'hi', 'hello', 'hey'."""
     return re.sub(r'^(hi|hello|hey)[^\n]*\n?', '', text, flags=re.IGNORECASE).strip()
 
-# Call Gemini model
+# ─── Call Gemini Model ──────────────────────────────────────────────────────────
 def get_gemini_reply(prompt: str) -> str:
+    """Generate and clean a response from the Gemini model."""
     try:
         resp = model.generate_content(prompt)
         return strip_greeting(resp.text.strip())
@@ -96,10 +106,10 @@ def get_gemini_reply(prompt: str) -> str:
         print("Gemini error:", e)
         return "Sorry, I encountered an error."
 
-# Webhook endpoint
+# ─── Main Webhook Endpoint ───────────────────────────────────────────────────────
 @app.route("/webhook", methods=["GET","POST"])
 def webhook():
-    # Verify GET
+    # Verification handshake
     if request.method == "GET":
         if request.args.get("hub.mode")=="subscribe" and request.args.get("hub.verify_token")==VERIFY_TOKEN:
             return request.args.get("hub.challenge"), 200
@@ -115,13 +125,13 @@ def webhook():
     user = get_or_create_user(phone)
     text = msg.get("text", {}).get("body", "").strip()
 
-    # Greeting: if user has name and sends a greeting word, welcome
+    # Welcome-back greeting on greeting keywords
     if user.get("name") and text.lower() in ("hi","hello","hey"):
         first = user["name"].split()[0]
         send_whatsapp_message(phone, f"Welcome back, {first}! 🎓 What would you like to study today?")
         return "OK", 200
 
-    # Onboard new user: ask for full name
+    # Onboard new user: collect full name
     if not user.get("name"):
         if len(text.split()) >= 2:
             update_user(phone, name=text)
@@ -149,17 +159,19 @@ def webhook():
     # Credit reset logic for free users
     if user.get("account_type") == "free":
         rt = user.get("credit_reset")
+        # Convert Firestore Timestamp or aware datetime to naive datetime
         if hasattr(rt, 'to_datetime'):
-            rt = rt.to_datetime().replace(tzinfo=None)
+            rt = rt.to_datetime()
+        if isinstance(rt, datetime) and rt.tzinfo is not None:
+            rt = rt.replace(tzinfo=None)
         if isinstance(rt, datetime) and datetime.utcnow() >= rt:
             update_user(phone, credit_remaining=20, credit_reset=datetime.utcnow() + timedelta(days=1))
             user["credit_remaining"] = 20
 
+        # Check and deduct credits
         if user.get("credit_remaining", 0) <= 0:
             send_whatsapp_message(phone, "Free limit reached (20/day). Upgrade to Premium for unlimited prompts.")
             return "OK", 200
-
-        # Deduct credit
         new_credits = user.get("credit_remaining", 1) - 1
         update_user(phone, credit_remaining=new_credits)
         user["credit_remaining"] = new_credits
@@ -180,5 +192,6 @@ def webhook():
 
     return "OK", 200
 
+# ─── Entry Point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
