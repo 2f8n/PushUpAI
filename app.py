@@ -21,8 +21,15 @@ MODEL_NAME = "gemini-1.5-pro-002"
 model = genai.GenerativeModel(MODEL_NAME)
 
 # ─── Firebase Init ─────────────────────────────────────────────────────────────
-# Make sure you have set GOOGLE_APPLICATION_CREDENTIALS="/path/to/serviceAccountKey.json"
-cred_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "serviceAccountKey.json")
+# Secret file is mounted at app root or under /etc/secrets/
+key_filename = "serviceAccountKey.json"
+secret_location = f"/etc/secrets/{key_filename}"
+if os.path.exists(secret_location):
+    cred_path = secret_location
+else:
+    cred_path = key_filename
+
+# Initialize Firebase Admin SDK
 cred = credentials.Certificate(cred_path)
 firebase_admin.initialize_app(cred)
 db = firestore.client()
@@ -37,9 +44,7 @@ def get_or_create_user(phone: str) -> dict:
             "name": None,
             "date_joined": firestore.SERVER_TIMESTAMP,
             "last_prompt": None,
-            # you can add credit fields here when ready:
-            # "credit_remaining": 20,
-            # "credit_reset": datetime.utcnow() + timedelta(days=1),
+            # credit fields can be added here later
         }
         doc_ref.set(user_data)
         return user_data
@@ -151,7 +156,9 @@ def webhook():
             elif payload == "explain_more":
                 last = user.get("last_prompt")
                 if last:
-                    detail = get_gemini_reply(last + "\n\nPlease explain in more detail.")
+                    detail = get_gemini_reply(last + "
+
+Please explain in more detail.")
                     send_whatsapp_message(phone, detail)
                     send_interactive_buttons(phone)
                 else:
