@@ -1,4 +1,3 @@
-```python
 from flask import Flask, request
 import os
 import re
@@ -156,7 +155,6 @@ def webhook():
             elif payload == "explain_more":
                 last_prompt = user.get("last_prompt")
                 if last_prompt:
-                    # Properly terminated string literal
                     detail = get_gemini_reply(last_prompt + "\n\nPlease explain in more detail.")
                     send_whatsapp_message(phone, detail)
                     send_interactive_buttons(phone)
@@ -185,4 +183,3 @@ def webhook():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
-```
