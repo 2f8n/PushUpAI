@@ -42,9 +42,9 @@ def get_or_create_user(phone: str) -> dict:
         user_data = {
             "phone": phone,
             "name": None,
+            "greeted": False,
             "date_joined": firestore.SERVER_TIMESTAMP,
-            "last_prompt": None,
-            # credit fields can be added here later
+            "last_prompt": None
         }
         doc_ref.set(user_data)
         return user_data
@@ -109,7 +109,6 @@ def get_gemini_reply(prompt: str) -> str:
 # ─── Webhook ───────────────────────────────────────────────────────────────────
 @app.route("/webhook", methods=["GET", "POST"])
 def webhook():
-    # Verification handshake
     if request.method == "GET":
         if (
             request.args.get("hub.mode") == "subscribe" and
@@ -127,9 +126,14 @@ def webhook():
 
         msg = entry["messages"][0]
         phone = msg["from"]
-
-        # Fetch or create Firestore user record
         user = get_or_create_user(phone)
+
+        # ─── Welcome back if known ───────────────────────────────────────
+        if user.get("name") and not user.get("greeted"):
+            first_name = user["name"].split()[0]
+            send_whatsapp_message(phone, f"Welcome back, {first_name}! 🎓 What would you like to study today?")
+            update_user(phone, greeted=True)
+            return "OK", 200
 
         # ─── Onboarding: ask for full name if missing ──────────────────────
         if not user.get("name"):
@@ -140,6 +144,7 @@ def webhook():
                     phone,
                     f"Nice to meet you, {text}! 🎓 What would you like to study today?"
                 )
+                update_user(phone, greeted=True)
             else:
                 send_whatsapp_message(
                     phone,
@@ -147,7 +152,7 @@ def webhook():
                 )
             return "OK", 200
 
-        # ─── Button Replies: Understood / Explain more ──────────────────────
+        # ─── Button Replies: Understood / Explain more only ────────────────
         if msg.get("type") == "button":
             payload = msg["button"]["payload"]
             if payload == "understood":
@@ -162,7 +167,7 @@ def webhook():
                     send_whatsapp_message(phone, "Sorry, I don't have anything to expand on yet.")
             return "OK", 200
 
-        # ─── Normal Study Query ────────────────────────────────────────────
+        # ─── Pure Academic Query ───────────────────────────────────────────
         user_text = msg.get("text", {}).get("body", "").strip()
         prompt = (
             f"You are StudyMate AI, founded by ByteWave Media, "
