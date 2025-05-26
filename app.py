@@ -1,3 +1,4 @@
+```python
 from flask import Flask, request
 import os
 import re
@@ -84,8 +85,8 @@ def send_interactive_buttons(phone: str):
             "body": {"text": "Did that make sense to you?"},
             "action": {
                 "buttons": [
-                    {"type":"reply", "reply":{"id":"understood","title":"Understood"}},
-                    {"type":"reply", "reply":{"id":"explain_more","title":"Explain more"}}
+                    {"type": "reply", "reply": {"id": "understood", "title": "Understood"}},
+                    {"type": "reply", "reply": {"id": "explain_more", "title": "Explain more"}}
                 ]
             }
         }
@@ -93,7 +94,7 @@ def send_interactive_buttons(phone: str):
     resp = requests.post(url, headers=headers, json=payload)
     print("Interactive buttons response:", resp.status_code, resp.text)
 
-# ─── Text Cleaners ─────────────────────────────────────────────────────────────
+# ─── Text Cleaner ──────────────────────────────────────────────────────────────
 def strip_greeting(text: str) -> str:
     return re.sub(r'^(hi|hello|hey)[^\n]*\n?', '', text, flags=re.IGNORECASE).strip()
 
@@ -111,8 +112,10 @@ def get_gemini_reply(prompt: str) -> str:
 def webhook():
     # Verification handshake
     if request.method == "GET":
-        if (request.args.get("hub.mode") == "subscribe" and
-            request.args.get("hub.verify_token") == VERIFY_TOKEN):
+        if (
+            request.args.get("hub.mode") == "subscribe" and
+            request.args.get("hub.verify_token") == VERIFY_TOKEN
+        ):
             return request.args.get("hub.challenge"), 200
         return "Verification failed", 403
 
@@ -149,16 +152,12 @@ def webhook():
         if msg.get("type") == "button":
             payload = msg["button"]["payload"]
             if payload == "understood":
-                send_whatsapp_message(
-                    phone,
-                    "Great! 🎉 What's next on your study list?"
-                )
+                send_whatsapp_message(phone, "Great! 🎉 What's next on your study list?")
             elif payload == "explain_more":
-                last = user.get("last_prompt")
-                if last:
-                    detail = get_gemini_reply(last + "
-
-Please explain in more detail.")
+                last_prompt = user.get("last_prompt")
+                if last_prompt:
+                    # Properly terminated string literal
+                    detail = get_gemini_reply(last_prompt + "\n\nPlease explain in more detail.")
                     send_whatsapp_message(phone, detail)
                     send_interactive_buttons(phone)
                 else:
@@ -186,3 +185,4 @@ Please explain in more detail.")
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+```
