@@ -1,40 +1,52 @@
 from flask import Flask, request
 import os
-import json
 import re
 import requests
+import firebase_admin
+from firebase_admin import credentials, firestore
 import google.generativeai as genai
+from datetime import datetime, timedelta
 
 app = Flask(__name__)
 
 # ─── Environment ────────────────────────────────────────────────────────────────
-VERIFY_TOKEN   = os.environ.get("VERIFY_TOKEN",   "pushupai_verify_token")
-ACCESS_TOKEN   = os.environ.get("ACCESS_TOKEN",   "")
-PHONE_NUMBER_ID= os.environ.get("PHONE_NUMBER_ID","")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+VERIFY_TOKEN    = os.environ.get("VERIFY_TOKEN",    "pushupai_verify_token")
+ACCESS_TOKEN    = os.environ.get("ACCESS_TOKEN",    "")
+PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID", "")
+GEMINI_API_KEY  = os.environ.get("GEMINI_API_KEY",  "")
 
 # ─── Gemini Init ───────────────────────────────────────────────────────────────
 genai.configure(api_key=GEMINI_API_KEY)
 MODEL_NAME = "gemini-1.5-pro-002"
 model = genai.GenerativeModel(MODEL_NAME)
 
-# ─── Memory Helpers ────────────────────────────────────────────────────────────
-MEMORY_DIR = "memory"
-def memory_path(phone: str) -> str:
-    return os.path.join(MEMORY_DIR, f"{phone}.json")
+# ─── Firebase Init ─────────────────────────────────────────────────────────────
+# Make sure you have set GOOGLE_APPLICATION_CREDENTIALS="/path/to/serviceAccountKey.json"
+cred_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "serviceAccountKey.json")
+cred = credentials.Certificate(cred_path)
+firebase_admin.initialize_app(cred)
+db = firestore.client()
 
-def load_memory(phone: str) -> dict:
-    try:
-        with open(memory_path(phone), "r") as f:
-            return json.load(f)
-    except FileNotFoundError:
-        return {}
+# ─── Firestore Helpers ─────────────────────────────────────────────────────────
+def get_or_create_user(phone: str) -> dict:
+    doc_ref = db.collection("users").document(phone)
+    doc = doc_ref.get()
+    if not doc.exists:
+        user_data = {
+            "phone": phone,
+            "name": None,
+            "date_joined": firestore.SERVER_TIMESTAMP,
+            "last_prompt": None,
+            # you can add credit fields here when ready:
+            # "credit_remaining": 20,
+            # "credit_reset": datetime.utcnow() + timedelta(days=1),
+        }
+        doc_ref.set(user_data)
+        return user_data
+    return doc.to_dict()
 
-def save_memory(phone: str, data: dict):
-    os.makedirs(MEMORY_DIR, exist_ok=True)
-    with open(memory_path(phone), "w") as f:
-        json.dump(data, f)
-    print(f"[✔] Memory saved: {memory_path(phone)}")
+def update_user(phone: str, **fields):
+    db.collection("users").document(phone).update(fields)
 
 # ─── WhatsApp Senders ──────────────────────────────────────────────────────────
 def send_whatsapp_message(phone: str, text: str):
@@ -78,7 +90,6 @@ def send_interactive_buttons(phone: str):
 
 # ─── Text Cleaners ─────────────────────────────────────────────────────────────
 def strip_greeting(text: str) -> str:
-    # remove common greetings at start
     return re.sub(r'^(hi|hello|hey)[^\n]*\n?', '', text, flags=re.IGNORECASE).strip()
 
 # ─── Gemini Reply ──────────────────────────────────────────────────────────────
@@ -93,6 +104,7 @@ def get_gemini_reply(prompt: str) -> str:
 # ─── Webhook ───────────────────────────────────────────────────────────────────
 @app.route("/webhook", methods=["GET", "POST"])
 def webhook():
+    # Verification handshake
     if request.method == "GET":
         if (request.args.get("hub.mode") == "subscribe" and
             request.args.get("hub.verify_token") == VERIFY_TOKEN):
@@ -108,15 +120,15 @@ def webhook():
 
         msg = entry["messages"][0]
         phone = msg["from"]
-        memory = load_memory(phone)
+
+        # Fetch or create Firestore user record
+        user = get_or_create_user(phone)
 
         # ─── Onboarding: ask for full name if missing ──────────────────────
-        if "name" not in memory:
-            # if user is replying with a name (two words)
+        if not user.get("name"):
             text = msg.get("text", {}).get("body", "").strip()
             if len(text.split()) >= 2:
-                memory["name"] = text
-                save_memory(phone, memory)
+                update_user(phone, name=text)
                 send_whatsapp_message(
                     phone,
                     f"Nice to meet you, {text}! 🎓 What would you like to study today?"
@@ -137,9 +149,9 @@ def webhook():
                     "Great! 🎉 What's next on your study list?"
                 )
             elif payload == "explain_more":
-                last_prompt = memory.get("last_prompt")
-                if last_prompt:
-                    detail = get_gemini_reply(last_prompt + "\n\nPlease explain in more detail.")
+                last = user.get("last_prompt")
+                if last:
+                    detail = get_gemini_reply(last + "\n\nPlease explain in more detail.")
                     send_whatsapp_message(phone, detail)
                     send_interactive_buttons(phone)
                 else:
@@ -148,16 +160,12 @@ def webhook():
 
         # ─── Normal Study Query ────────────────────────────────────────────
         user_text = msg.get("text", {}).get("body", "").strip()
-        # build prompt with context
-        name = memory["name"]
         prompt = (
             f"You are StudyMate AI, founded by ByteWave Media, "
-            f"helping {name}. Question:\n\n{user_text}\n\n"
-            "Give a clear, step-by-step explanation. "
-            "Use an encouraging, conversational tone."
+            f"helping {user['name']}. Question:\n\n{user_text}\n\n"
+            "Give a clear, step-by-step explanation. Use an encouraging, conversational tone."
         )
-        memory["last_prompt"] = prompt
-        save_memory(phone, memory)
+        update_user(phone, last_prompt=prompt)
 
         send_whatsapp_message(phone, "🤖 Thinking...")
         answer = get_gemini_reply(prompt)
