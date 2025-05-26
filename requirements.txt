@@ -1,5 +1,5 @@
- flask
- requests
- gunicorn
- google-generativeai
-+firebase-admin        # the Firebase Admin SDK for Python
+flask
+requests
+gunicorn
+google-generativeai
+firebase-admin
