@@ -1,7 +1,5 @@
-flask
-requests
-gunicorn
-google-generativeai
-pdfplumber
-pytesseract
-Pillow
+ flask
+ requests
+ gunicorn
+ google-generativeai
++firebase-admin        # the Firebase Admin SDK for Python
