@@ -41,9 +41,6 @@ db = firestore.client()
 
 # ─── Helper: Load or Create User ────────────────────────────────────────────────
 def get_or_create_user(phone: str) -> dict:
-    """
-    Retrieve user document or create a new one with default fields.
-    """
     doc_ref = db.collection("users").document(phone)
     doc = doc_ref.get()
     if not doc.exists:
@@ -62,43 +59,36 @@ def get_or_create_user(phone: str) -> dict:
 
 # ─── Helper: Update User Fields ─────────────────────────────────────────────────
 def update_user(phone: str, **fields):
-    """
-    Update specified fields for a user document.
-    """
     db.collection("users").document(phone).update(fields)
 
 # ─── Send Text Message ──────────────────────────────────────────────────────────
 def send_whatsapp_message(phone: str, text: str):
-    """Send a text message via WhatsApp Cloud API."""
     url = f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages"
     headers = {"Authorization": f"Bearer {ACCESS_TOKEN}", "Content-Type": "application/json"}
-    payload = {"messaging_product":"whatsapp", "to":phone, "type":"text", "text":{"body":text}}
+    payload = {"messaging_product":"whatsapp","to":phone,"type":"text","text":{"body":text}}
     requests.post(url, headers=headers, json=payload)
 
 # ─── Send Interactive Buttons ───────────────────────────────────────────────────
 def send_interactive_buttons(phone: str):
-    """Send 'Understood'/'Explain more' buttons."""
     url = f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages"
     headers = {"Authorization": f"Bearer {ACCESS_TOKEN}", "Content-Type": "application/json"}
     interactive = {
-        "type":"button",
-        "body":{"text":"Did that make sense to you?"},
-        "action":{"buttons":[
-            {"type":"reply","reply":{"id":"understood","title":"Understood"}},
-            {"type":"reply","reply":{"id":"explain_more","title":"Explain more"}}
+        "type": "button",
+        "body": {"text": "Did that make sense to you?"},
+        "action": {"buttons": [
+            {"type": "reply", "reply": {"id": "understood",   "title": "Understood"}},
+            {"type": "reply", "reply": {"id": "explain_more", "title": "Explain more"}}
         ]}
     }
-    payload = {"messaging_product":"whatsapp", "to":phone, "type":"interactive", "interactive":interactive}
+    payload = {"messaging_product": "whatsapp", "to": phone, "type": "interactive", "interactive": interactive}
     requests.post(url, headers=headers, json=payload)
 
 # ─── Strip Leading Greetings ─────────────────────────────────────────────────────
 def strip_greeting(text: str) -> str:
-    """Remove leading greetings like 'hi', 'hello', 'hey'."""
     return re.sub(r'^(hi|hello|hey)[^\n]*\n?', '', text, flags=re.IGNORECASE).strip()
 
 # ─── Call Gemini Model ──────────────────────────────────────────────────────────
 def get_gemini_reply(prompt: str) -> str:
-    """Generate and clean a response from the Gemini model."""
     try:
         resp = model.generate_content(prompt)
         return strip_greeting(resp.text.strip())
@@ -125,13 +115,13 @@ def webhook():
     user = get_or_create_user(phone)
     text = msg.get("text", {}).get("body", "").strip()
 
-    # Welcome-back greeting on greeting keywords
+    # Welcome-back on greeting keywords
     if user.get("name") and text.lower() in ("hi","hello","hey"):
         first = user["name"].split()[0]
         send_whatsapp_message(phone, f"Welcome back, {first}! 🎓 What would you like to study today?")
         return "OK", 200
 
-    # Onboard new user: collect full name
+    # Onboard: collect full name
     if not user.get("name"):
         if len(text.split()) >= 2:
             update_user(phone, name=text)
@@ -146,20 +136,22 @@ def webhook():
         return "OK", 200
 
     # Handle interactive button replies
-    if msg.get("type") == "button":
-        payload = msg["button"]["payload"]
-        if payload == "understood":
-            send_whatsapp_message(phone, "Great! 🎉 What's next on your study list?")
-        elif payload == "explain_more" and user.get("last_prompt"):
-            detail = get_gemini_reply(user["last_prompt"] + "\n\nPlease explain in more detail.")
-            send_whatsapp_message(phone, detail)
-            send_interactive_buttons(phone)
-        return "OK", 200
+    if msg.get("type") == "interactive":
+        interactive = msg.get("interactive", {})
+        if interactive.get("type") == "button_reply":
+            payload = interactive.get("button_reply", {}).get("id")
+            if payload == "understood":
+                send_whatsapp_message(phone, "Great! 🎉 What's next on your study list?")
+                return "OK", 200
+            if payload == "explain_more" and user.get("last_prompt"):
+                detail = get_gemini_reply(user["last_prompt"] + "\n\nPlease explain in more detail.")
+                send_whatsapp_message(phone, detail)
+                send_interactive_buttons(phone)
+                return "OK", 200
 
     # Credit reset logic for free users
     if user.get("account_type") == "free":
         rt = user.get("credit_reset")
-        # Convert Firestore Timestamp or aware datetime to naive datetime
         if hasattr(rt, 'to_datetime'):
             rt = rt.to_datetime()
         if isinstance(rt, datetime) and rt.tzinfo is not None:
@@ -167,8 +159,6 @@ def webhook():
         if isinstance(rt, datetime) and datetime.utcnow() >= rt:
             update_user(phone, credit_remaining=20, credit_reset=datetime.utcnow() + timedelta(days=1))
             user["credit_remaining"] = 20
-
-        # Check and deduct credits
         if user.get("credit_remaining", 0) <= 0:
             send_whatsapp_message(phone, "Free limit reached (20/day). Upgrade to Premium for unlimited prompts.")
             return "OK", 200
