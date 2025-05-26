@@ -21,8 +21,8 @@ MODEL_NAME = "gemini-1.5-pro-002"
 model = genai.GenerativeModel(MODEL_NAME)
 
 # ─── Firebase Init ─────────────────────────────────────────────────────────────
-# Secret file is mounted at app root or under /etc/secrets/
-key_filename = "serviceAccountKey.json"
+# Use the correct secret file name provided in Render Secret Files
+key_filename = "studymate-ai-9197f-firebase-adminsdk-fbsvc-5a52d9ff48.json"
 secret_location = f"/etc/secrets/{key_filename}"
 if os.path.exists(secret_location):
     cred_path = secret_location
