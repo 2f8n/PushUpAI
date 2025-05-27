@@ -3,7 +3,6 @@ import json
 import logging
 from collections import deque
 from datetime import datetime, timedelta
-import tempfile
 
 import requests
 from flask import Flask, request
@@ -22,7 +21,7 @@ try:
 except ImportError:
     pass
 
-# Environment variables
+# Environment variables check
 for v in ("VERIFY_TOKEN", "ACCESS_TOKEN", "PHONE_NUMBER_ID", "GEMINI_API_KEY"):
     if not os.getenv(v):
         logger.error(f"Missing environment variable: {v}")
@@ -38,16 +37,16 @@ PORT = int(os.getenv("PORT", 10000))
 genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel("gemini-1.5-pro-002")
 
-# Initialize Firebase (using secret file mounted in /etc/secrets/)
+# Initialize Firebase (service account from mounted secret)
 firebase_secret_path = "/etc/secrets/studymate-ai-9197f-firebase-adminsdk-fbsvc-5a52d9ff48.json"
 cred = credentials.Certificate(firebase_secret_path)
 firebase_admin.initialize_app(cred)
 db = firestore.client()
 
-# Initialize Google Speech client once (global)
+# Initialize Google Speech client
 speech_client = speech.SpeechClient()
 
-# Load system prompt (AI instruction guide)
+# Load system prompt
 with open("studymate_prompt.txt", "r") as f:
     SYSTEM_PROMPT = f.read().strip()
 
@@ -105,7 +104,9 @@ def strip_fences(t):
 
 def get_gemini(prompt):
     try:
-        return model.generate_content(prompt).text.strip()
+        response = model.generate_content(prompt)
+        logger.info(f"Gemini response raw:\n{response.text}")
+        return response.text.strip()
     except Exception:
         logger.exception("Gemini error")
         return json.dumps({"type": "clarification", "content": "Sorry, I encountered an error. Please try again."})
@@ -143,6 +144,7 @@ def build_prompt(user, history, message):
 
 def transcribe_audio_from_url(media_url):
     try:
+        # Download the audio file content
         response = requests.get(media_url)
         response.raise_for_status()
         audio_content = response.content
@@ -150,7 +152,6 @@ def transcribe_audio_from_url(media_url):
         logger.error(f"Failed to download media: {e}")
         return None
 
-    # Recognize audio content with Google Speech-to-Text
     audio = speech.RecognitionAudio(content=audio_content)
     config = speech.RecognitionConfig(
         encoding=speech.RecognitionConfig.AudioEncoding.OGG_OPUS,
@@ -188,25 +189,28 @@ def webhook():
     if not phone:
         return "OK", 200
 
-    # Detect message type: text or audio
     msg_type = msg.get("type")
     text = ""
-    if msg_type == "text":
-        text = msg.get("text", {}).get("body", "").strip()
-    elif msg_type in ("audio", "voice"):
+
+    # Handle voice/audio message transcription
+    if msg_type == "audio" or msg_type == "voice":
         media_id = msg.get(msg_type, {}).get("id")
         if not media_id:
             send_text(phone, "Sorry, I couldn't find the audio to process.")
             return "OK", 200
 
-        # Get media URL
+        # Fetch media URL from WhatsApp
         media_url_resp = requests.get(
             f"https://graph.facebook.com/v19.0/{media_id}",
             headers={"Authorization": f"Bearer {ACCESS_TOKEN}"},
         )
+        if media_url_resp.status_code != 200:
+            send_text(phone, "Sorry, I couldn't retrieve your audio. Please try again.")
+            return "OK", 200
+
         media_url = media_url_resp.json().get("url")
         if not media_url:
-            send_text(phone, "Sorry, I couldn't retrieve your audio. Please try again.")
+            send_text(phone, "Sorry, I couldn't retrieve your audio URL. Please try again.")
             return "OK", 200
 
         transcript = transcribe_audio_from_url(media_url)
@@ -216,8 +220,16 @@ def webhook():
 
         text = transcript
         logger.info(f"User {phone} audio transcribed to: {text}")
+
+    # Handle text message
+    elif msg_type == "text":
+        text = msg.get("text", {}).get("body", "").strip()
+
     else:
         # Ignore unsupported message types for now
+        return "OK", 200
+
+    if not text:
         return "OK", 200
 
     user = get_or_create_user(phone)
@@ -257,11 +269,11 @@ def webhook():
                 send_text(phone, "Great—what’s next?")
             elif bid == "explain_more" and user.get("last_prompt"):
                 more = get_gemini(user["last_prompt"] + "\n\nPlease explain in more detail.")
-                send_text(phone, strip_fences(more))
+                content = strip_fences(more)
+                send_text(phone, content)
                 send_buttons(phone)
         return "OK", 200
 
-    # Normal text or transcribed audio flow
     sess = ensure_session(phone)
     history = list(sess["history"])
     sess["history"].append(text)
@@ -278,12 +290,14 @@ def webhook():
         rtype = "answer"
         content = clean
 
+    # Ensure content is string
     if not isinstance(content, str):
         content = str(content)
 
+    # **FIX: Send only content text (no raw JSON)**
     send_text(phone, content)
 
-    # Send buttons ONLY if AI answered academically (rtype=="answer")
+    # Send buttons ONLY if AI gave academic answer (type == "answer")
     if rtype == "answer":
         send_buttons(phone)
 
