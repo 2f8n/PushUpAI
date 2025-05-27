@@ -10,7 +10,7 @@ from flask import Flask, request
 import firebase_admin
 from firebase_admin import credentials, firestore
 import google.generativeai as genai
-from google.cloud import vision
+from google.cloud import vision_v1  # <- fixed import
 import PyPDF2
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s — %(message)s")
@@ -40,7 +40,7 @@ genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel("gemini-1.5-pro-002")
 
 # Initialize Vision client
-vision_client = vision.ImageAnnotatorClient()
+vision_client = vision_v1.ImageAnnotatorClient()
 
 # Firestore setup
 KEY_FILE    = "studymate-ai-9197f-firebase-adminsdk-fbsvc-5a52d9ff48.json"
@@ -132,7 +132,6 @@ def build_prompt(user,history,message):
     return "\n".join(parts)
 
 def download_media(media_id):
-    # fetch URL
     meta = requests.get(
         f"https://graph.facebook.com/v15.0/{media_id}?fields=url",
         headers={"Authorization":f"Bearer {ACCESS_TOKEN}"}
@@ -156,17 +155,15 @@ def webhook():
     msg = entry[0]["changes"][0]["value"].get("messages",[{}])[0]
     phone = msg.get("from")
 
-    # Image handling
+    # IMAGE handling
     if msg.get("type")=="image":
         media_id = msg["image"]["id"]
         img_data = download_media(media_id)
         if img_data:
-            image = vision.Image(content=img_data)
+            image = vision_v1.types.Image(content=img_data)
             resp = vision_client.document_text_detection(image=image)
             extracted = resp.full_text_annotation.text or ""
-            prompt = SYSTEM_PROMPT + "\n" + \
-                     f'User name: "{get_or_create_user(phone)["name"].split()[0] if get_or_create_user(phone)["name"] else ""}"\n' + \
-                     f'Extracted text from image:\n{extracted}\nJSON:'
+            prompt = f"{SYSTEM_PROMPT}\nUser image text:\n{extracted}\nJSON:"
             raw = get_gemini(prompt)
             clean = strip_fences(raw)
             try:
@@ -179,21 +176,18 @@ def webhook():
             send_text(phone,"Could not retrieve your image.")
         return "OK",200
 
-    # Document handling (PDF)
+    # DOCUMENT (PDF) handling
     if msg.get("type")=="document":
         media_id = msg["document"]["id"]
         filename = msg["document"].get("filename","file.pdf")
         file_data = download_media(media_id)
         text_extract = ""
-        if file_data:
+        if file_data and filename.lower().endswith(".pdf"):
             path = f"/tmp/{filename}"
             with open(path,"wb") as f: f.write(file_data)
-            if filename.lower().endswith(".pdf"):
-                reader = PyPDF2.PdfReader(path)
-                text_extract = "\n".join(p.extract_text() or "" for p in reader.pages)
-        prompt = SYSTEM_PROMPT + "\n" + \
-                 f'User name: "{get_or_create_user(phone)["name"].split()[0] if get_or_create_user(phone)["name"] else ""}"\n' + \
-                 f'Extracted text from document:\n{text_extract}\nJSON:'
+            reader = PyPDF2.PdfReader(path)
+            text_extract = "\n".join(p.extract_text() or "" for p in reader.pages)
+        prompt = f"{SYSTEM_PROMPT}\nUser document text:\n{text_extract}\nJSON:"
         raw = get_gemini(prompt)
         clean = strip_fences(raw)
         try:
@@ -211,7 +205,7 @@ def webhook():
     user = get_or_create_user(phone)
     now  = datetime.utcnow()
 
-    # Onboarding
+    # ONBOARDING
     if user["name"] is None:
         if len(text.split())>=2:
             first = text.split()[0]
@@ -221,7 +215,7 @@ def webhook():
             send_text(phone,"Please share your full name (first and last).")
         return "OK",200
 
-    # Credits
+    # CREDITS
     if user["account_type"]=="free":
         rt = user["credit_reset"]
         if hasattr(rt,"to_datetime"): rt=rt.to_datetime()
@@ -234,20 +228,20 @@ def webhook():
             return "OK",200
         update_user(phone,credit_remaining=user["credit_remaining"]-1)
 
-    # Interactive replies
+    # BUTTON replies
     if msg.get("type")=="interactive":
         ir = msg.get("interactive",{})
         if ir.get("type")=="button_reply":
-            bid = ir["button_reply"]["id"]
+            bid=ir["button_reply"]["id"]
             if bid=="understood":
                 send_text(phone,"Great—what’s next?")
             elif bid=="explain_more" and user.get("last_prompt"):
-                more = get_gemini(user["last_prompt"]+"\n\nPlease explain in more detail.")
+                more=get_gemini(user["last_prompt"]+"\n\nPlease explain in more detail.")
                 send_text(phone,strip_fences(more))
                 send_buttons(phone)
         return "OK",200
 
-    # Text flow
+    # TEXT flow
     sess    = ensure_session(phone)
     history = list(sess["history"])
     sess["history"].append(text)
@@ -258,12 +252,12 @@ def webhook():
 
     try:
         j = json.loads(clean)
-        rtype = j.get("type"); content = j.get("content","")
+        rtype=j.get("type"); content=j.get("content","")
     except:
-        rtype = "answer"; content = clean
+        rtype="answer"; content=clean
 
     if not isinstance(content,str):
-        content = str(content)
+        content=str(content)
 
     send_text(phone,content)
     if rtype=="answer":
