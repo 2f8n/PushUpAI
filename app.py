@@ -20,28 +20,31 @@ try:
 except ImportError:
     pass
 
-# Environment variables check
+# Required env variables
 for v in ("VERIFY_TOKEN", "ACCESS_TOKEN", "PHONE_NUMBER_ID", "GEMINI_API_KEY"):
     if not os.getenv(v):
         logger.error(f"Missing environment variable: {v}")
         raise SystemExit("Please set all required environment variables.")
 
-VERIFY_TOKEN    = os.getenv("VERIFY_TOKEN")
-ACCESS_TOKEN    = os.getenv("ACCESS_TOKEN")
+VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
+ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
-GEMINI_API_KEY  = os.getenv("GEMINI_API_KEY")
-PORT            = int(os.getenv("PORT", 10000))
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+PORT = int(os.getenv("PORT", 10000))
+
+# Path to Firebase service account json in Render secret files
+FIREBASE_SECRET_PATH = "/etc/secrets/studymate-ai-9197f-firebase-adminsdk-fbsvc-5a52d9ff48.json"
+
+# Initialize Firebase with secret file path
+cred = credentials.Certificate(FIREBASE_SECRET_PATH)
+firebase_admin.initialize_app(cred)
+db = firestore.client()
 
 # Initialize Gemini AI
 genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel("gemini-1.5-pro-002")
 
-# Initialize Firebase
-cred = credentials.Certificate("studymate-ai-9197f-firebase-adminsdk-fbsvc-5a52d9ff48.json")
-firebase_admin.initialize_app(cred)
-db = firestore.client()
-
-# Load system prompt (your AI instruction guide)
+# Load system prompt instructions
 with open("studymate_prompt.txt", "r") as f:
     SYSTEM_PROMPT = f.read().strip()
 
@@ -56,9 +59,9 @@ def ensure_session(phone):
 def safe_post(url, payload):
     try:
         r = requests.post(url,
-            headers={"Authorization": f"Bearer {ACCESS_TOKEN}",
-                     "Content-Type": "application/json"},
-            json=payload)
+                          headers={"Authorization": f"Bearer {ACCESS_TOKEN}",
+                                   "Content-Type": "application/json"},
+                          json=payload)
         if r.status_code not in (200, 201):
             logger.error(f"WhatsApp API {r.status_code}: {r.text}")
     except Exception:
@@ -66,52 +69,40 @@ def safe_post(url, payload):
 
 def send_text(phone, text):
     safe_post(f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages", {
-        "messaging_product": "whatsapp",
-        "to": phone,
-        "type": "text",
-        "text": {"body": text}
+        "messaging_product": "whatsapp", "to": phone,
+        "type": "text", "text": {"body": text}
     })
 
 def send_buttons(phone):
     safe_post(f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages", {
-        "messaging_product": "whatsapp",
-        "to": phone,
-        "type": "interactive",
-        "interactive": {
-            "type": "button",
-            "body": {"text": "Did that make sense to you?"},
-            "action": {
-                "buttons": [
-                    {"type": "reply", "reply": {"id": "understood", "title": "Understood"}},
-                    {"type": "reply", "reply": {"id": "explain_more", "title": "Explain more"}}
-                ]
-            }
+        "messaging_product": "whatsapp", "to": phone,
+        "type": "interactive", "interactive": {
+            "type": "button", "body": {"text": "Did that make sense to you?"},
+            "action": {"buttons": [
+                {"type": "reply", "reply": {"id": "understood", "title": "Understood"}},
+                {"type": "reply", "reply": {"id": "explain_more", "title": "Explain more"}}
+            ]}
         }
     })
 
-def strip_fences(text):
-    # Remove code fences and whitespace
-    if text.startswith("```json"):
-        text = text[len("```json"):].strip()
-    elif text.startswith("```"):
-        text = text[3:].strip()
-    if text.endswith("```"):
-        text = text[:-3].strip()
-    return text.strip()
+def strip_fences(t):
+    t = t.strip()
+    if t.startswith("```"):
+        # Remove triple backticks and optional language hint
+        lines = t.splitlines()
+        if lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines[-1].strip() == "```":
+            lines = lines[:-1]
+        return "\n".join(lines).strip()
+    return t
 
-def get_gemini_response(prompt):
+def get_gemini(prompt):
     try:
-        raw_response = model.generate_content(prompt).text.strip()
-        cleaned = strip_fences(raw_response)
-        data = json.loads(cleaned)
-        rtype = data.get("type", "answer")
-        content = data.get("content", "")
-        if not isinstance(content, str):
-            content = str(content)
-        return rtype, content
-    except Exception as e:
-        logger.error(f"Error parsing Gemini response: {e}")
-        return "clarification", "Sorry, I encountered an error. Please try again."
+        return model.generate_content(prompt).text.strip()
+    except Exception:
+        logger.exception("Gemini error")
+        return json.dumps({"type": "clarification", "content": "Sorry, I encountered an error. Please try again."})
 
 def get_or_create_user(phone):
     ref = db.collection("users").document(phone)
@@ -136,6 +127,7 @@ def update_user(phone, **fields):
 def build_prompt(user, history, message):
     parts = [SYSTEM_PROMPT]
     if user.get("name"):
+        # Use first name only
         parts.append(f'User name: "{user["name"].split()[0]}"')
     if history:
         parts.append("Recent messages:")
@@ -163,7 +155,7 @@ def webhook():
     if not phone:
         return "OK", 200
 
-    # Only handle text messages here (no images/docs/files)
+    # Only handle text messages here
     text = msg.get("text", {}).get("body", "").strip()
     if not text:
         return "OK", 200
@@ -171,7 +163,7 @@ def webhook():
     user = get_or_create_user(phone)
     now = datetime.utcnow()
 
-    # Onboarding: ask for full name if unknown
+    # Name onboarding
     if user["name"] is None:
         if len(text.split()) >= 2:
             first_name = text.split()[0]
@@ -196,7 +188,7 @@ def webhook():
             return "OK", 200
         update_user(phone, credit_remaining=user["credit_remaining"] - 1)
 
-    # Handle interactive button replies
+    # Interactive replies (buttons)
     if msg.get("type") == "interactive":
         ir = msg.get("interactive", {})
         if ir.get("type") == "button_reply":
@@ -204,8 +196,8 @@ def webhook():
             if bid == "understood":
                 send_text(phone, "Great—what’s next?")
             elif bid == "explain_more" and user.get("last_prompt"):
-                more = get_gemini_response(user["last_prompt"] + "\n\nPlease explain in more detail.")[1]
-                send_text(phone, more)
+                more = get_gemini(user["last_prompt"] + "\n\nPlease explain in more detail.")
+                send_text(phone, strip_fences(more))
                 send_buttons(phone)
         return "OK", 200
 
@@ -215,17 +207,30 @@ def webhook():
     sess["history"].append(text)
 
     prompt = build_prompt(user, history, text)
-    rtype, content = get_gemini_response(prompt)
+    raw = get_gemini(prompt)
+    clean = strip_fences(raw)
 
+    try:
+        j = json.loads(clean)
+        rtype = j.get("type")
+        content = j.get("content", "")
+    except Exception:
+        rtype = "answer"
+        content = clean
+
+    # Clean content type issues
+    if not isinstance(content, str):
+        content = str(content)
+
+    # Send only the content, not the JSON structure
     send_text(phone, content)
 
-    # Send buttons only if the type is "answer" (academic solving)
+    # Send buttons ONLY if this is an academic answer (type=="answer")
     if rtype == "answer":
         send_buttons(phone)
 
     update_user(phone, last_prompt=prompt)
     return "OK", 200
-
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=PORT)
