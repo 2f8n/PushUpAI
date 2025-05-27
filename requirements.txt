@@ -4,3 +4,4 @@ gunicorn
 firebase-admin
 google-generativeai
 pytest
+python-dotenv
