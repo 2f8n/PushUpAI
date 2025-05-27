@@ -13,27 +13,28 @@ from flask import Flask, request
 import firebase_admin
 from firebase_admin import credentials, firestore
 
-# Service-account JSON (already mounted under this path)
+# Load service-account JSON from the path Render mounts
 cred_path = os.getenv(
     "GOOGLE_APPLICATION_CREDENTIALS",
     "studymate-ai-9197f-firebase-adminsdk-fbsvc-5a52d9ff48.json"
 )
-project_id = os.getenv("PROJECT_ID", None)
+# Read your Firebase Project ID
+project_id = os.getenv("PROJECT_ID")
 
+# Initialize Admin SDK with both credentials and project ID
 cred = credentials.Certificate(cred_path)
 firebase_admin.initialize_app(cred, {"projectId": project_id})
 db = firestore.client()
 
-
 # === Flask & WhatsApp setup ===
 app = Flask(__name__)
 
+# These names match the vars you set in Render’s dashboard
 VERIFY_TOKEN      = os.getenv("VERIFY_TOKEN", "pushupai_verify_token")
 WHATSAPP_TOKEN    = os.getenv("ACCESS_TOKEN", "")
 WHATSAPP_PHONE_ID = os.getenv("PHONE_NUMBER_ID", "")
 
-
-# === Gemini (GenAI) setup ===
+# === Google Gemini (GenAI) setup ===
 import google.generativeai as genai
 GENAI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 genai.configure(api_key=GENAI_API_KEY)
@@ -120,14 +121,18 @@ def get_gemini_reply(prompt: str) -> str:
 
 @app.route("/webhook", methods=["GET", "POST"])
 def webhook():
-    # 1) Verification handshake
+    # 1) Verify handshake
     if request.method == "GET":
-        if request.args.get("hub.mode") == "subscribe" and request.args.get("hub.verify_token") == VERIFY_TOKEN:
+        if (
+            request.args.get("hub.mode") == "subscribe" and
+            request.args.get("hub.verify_token") == VERIFY_TOKEN
+        ):
             return request.args.get("hub.challenge"), 200
         return "Verification failed", 403
 
-    # 2) Message processing
-    entry = request.json["entry"][0]["changes"][0]["value"]
+    # 2) Process incoming messages
+    data = request.get_json(force=True)
+    entry = data["entry"][0]["changes"][0]["value"]
     if "messages" not in entry:
         return "OK", 200
 
@@ -136,13 +141,13 @@ def webhook():
     text = msg.get("text", {}).get("body", "").strip()
     user = get_or_create_user(phone)
 
-    # a) Welcome-back on greeting
+    # a) Welcome back on simple greeting
     if user.get("name") and text.lower() in ("hi", "hello", "hey"):
         first = user["name"].split()[0]
         send_whatsapp_message(phone, f"Welcome back, {first}! 🎓 What would you like to study today?")
         return "OK", 200
 
-    # b) Collect full name for new users
+    # b) Onboard new users (collect full name)
     if not user.get("name"):
         if len(text.split()) >= 2:
             update_user(phone, name=text)
@@ -156,7 +161,7 @@ def webhook():
         send_whatsapp_message(phone, "I only answer academic study questions. What topic are you curious about?")
         return "OK", 200
 
-    # d) Interactive-button replies
+    # d) Handle interactive button replies
     if msg.get("type") == "interactive":
         ir = msg.get("interactive")
         if ir.get("type") == "button_reply":
@@ -170,7 +175,7 @@ def webhook():
                 send_interactive_buttons(phone)
                 return "OK", 200
 
-    # e) Free-user credit management
+    # e) Credit management for free tier
     if user.get("account_type") == "free":
         rt = user.get("credit_reset")
         if hasattr(rt, "to_datetime"):
@@ -183,7 +188,7 @@ def webhook():
             return "OK", 200
         update_user(phone, credit_remaining=user["credit_remaining"] - 1)
 
-    # f) Academic Q&A
+    # f) Academic Q&A flow
     prompt = (
         f"You are StudyMate AI, an academic tutor by ByteWave Media. "
         f"Answer the question below with clear, step-by-step academic explanations only. "
