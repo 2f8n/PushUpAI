@@ -13,35 +13,35 @@ import google.generativeai as genai
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s — %(message)s")
 logger = logging.getLogger("StudyMate")
 
-# Load .env if available
+# Load .env if present
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
     pass
 
-# Required environment variables
+# Environment variables check
 for v in ("VERIFY_TOKEN", "ACCESS_TOKEN", "PHONE_NUMBER_ID", "GEMINI_API_KEY"):
     if not os.getenv(v):
         logger.error(f"Missing environment variable: {v}")
-        raise SystemExit(f"Please set environment variable {v}")
+        raise SystemExit("Please set all required environment variables.")
 
-VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
-ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
+VERIFY_TOKEN    = os.getenv("VERIFY_TOKEN")
+ACCESS_TOKEN    = os.getenv("ACCESS_TOKEN")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-PORT = int(os.getenv("PORT", 10000))
+GEMINI_API_KEY  = os.getenv("GEMINI_API_KEY")
+PORT            = int(os.getenv("PORT", 10000))
 
-# Configure Gemini AI
+# Initialize Gemini AI
 genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel("gemini-1.5-pro-002")
 
-# Initialize Firebase Admin SDK
+# Initialize Firebase
 cred = credentials.Certificate("studymate-ai-9197f-firebase-adminsdk-fbsvc-5a52d9ff48.json")
 firebase_admin.initialize_app(cred)
 db = firestore.client()
 
-# Load AI system prompt from file
+# Load system prompt (your AI instruction guide)
 with open("studymate_prompt.txt", "r") as f:
     SYSTEM_PROMPT = f.read().strip()
 
@@ -55,60 +55,63 @@ def ensure_session(phone):
 
 def safe_post(url, payload):
     try:
-        r = requests.post(
-            url,
-            headers={"Authorization": f"Bearer {ACCESS_TOKEN}", "Content-Type": "application/json"},
-            json=payload,
-        )
+        r = requests.post(url,
+            headers={"Authorization": f"Bearer {ACCESS_TOKEN}",
+                     "Content-Type": "application/json"},
+            json=payload)
         if r.status_code not in (200, 201):
             logger.error(f"WhatsApp API {r.status_code}: {r.text}")
     except Exception:
         logger.exception("Failed WhatsApp send")
 
 def send_text(phone, text):
-    safe_post(
-        f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages",
-        {
-            "messaging_product": "whatsapp",
-            "to": phone,
-            "type": "text",
-            "text": {"body": text},
-        },
-    )
+    safe_post(f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages", {
+        "messaging_product": "whatsapp",
+        "to": phone,
+        "type": "text",
+        "text": {"body": text}
+    })
 
 def send_buttons(phone):
-    safe_post(
-        f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages",
-        {
-            "messaging_product": "whatsapp",
-            "to": phone,
-            "type": "interactive",
-            "interactive": {
-                "type": "button",
-                "body": {"text": "Did that make sense to you?"},
-                "action": {
-                    "buttons": [
-                        {"type": "reply", "reply": {"id": "understood", "title": "Understood"}},
-                        {"type": "reply", "reply": {"id": "explain_more", "title": "Explain more"}},
-                    ]
-                },
-            },
-        },
-    )
+    safe_post(f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages", {
+        "messaging_product": "whatsapp",
+        "to": phone,
+        "type": "interactive",
+        "interactive": {
+            "type": "button",
+            "body": {"text": "Did that make sense to you?"},
+            "action": {
+                "buttons": [
+                    {"type": "reply", "reply": {"id": "understood", "title": "Understood"}},
+                    {"type": "reply", "reply": {"id": "explain_more", "title": "Explain more"}}
+                ]
+            }
+        }
+    })
 
-def strip_fences(t):
-    t = t.strip()
-    if t.startswith("```") and t.endswith("```"):
-        t = t[3:-3].strip()
-    return t
+def strip_fences(text):
+    # Remove code fences and whitespace
+    if text.startswith("```json"):
+        text = text[len("```json"):].strip()
+    elif text.startswith("```"):
+        text = text[3:].strip()
+    if text.endswith("```"):
+        text = text[:-3].strip()
+    return text.strip()
 
-def get_gemini(prompt):
+def get_gemini_response(prompt):
     try:
-        return model.generate_content(prompt).text.strip()
-    except Exception:
-        logger.exception("Gemini error")
-        # Return safe JSON string for fallback
-        return json.dumps({"type": "clarification", "content": "Sorry, I encountered an error. Please try again."})
+        raw_response = model.generate_content(prompt).text.strip()
+        cleaned = strip_fences(raw_response)
+        data = json.loads(cleaned)
+        rtype = data.get("type", "answer")
+        content = data.get("content", "")
+        if not isinstance(content, str):
+            content = str(content)
+        return rtype, content
+    except Exception as e:
+        logger.error(f"Error parsing Gemini response: {e}")
+        return "clarification", "Sorry, I encountered an error. Please try again."
 
 def get_or_create_user(phone):
     ref = db.collection("users").document(phone)
@@ -120,7 +123,7 @@ def get_or_create_user(phone):
             "account_type": "free",
             "credit_remaining": 20,
             "credit_reset": datetime.utcnow() + timedelta(days=1),
-            "last_prompt": None,
+            "last_prompt": None
         }
         ref.set(user)
         return user
@@ -130,16 +133,10 @@ def update_user(phone, **fields):
     db.collection("users").document(phone).update(fields)
     logger.info(f"Updated {phone}: {fields}")
 
-def is_greeting(text):
-    greetings = ["hi", "hello", "hey", "good morning", "good afternoon", "good evening", "hiya", "yo", "greetings"]
-    text_lower = text.lower()
-    return any(g in text_lower for g in greetings)
-
 def build_prompt(user, history, message):
     parts = [SYSTEM_PROMPT]
     if user.get("name"):
-        first_name = user["name"].split()[0]
-        parts.append(f'User name: "{first_name}"')
+        parts.append(f'User name: "{user["name"].split()[0]}"')
     if history:
         parts.append("Recent messages:")
         parts.extend(f"- {h}" for h in history)
@@ -150,7 +147,8 @@ def build_prompt(user, history, message):
 @app.route("/webhook", methods=["GET", "POST"])
 def webhook():
     if request.method == "GET":
-        if request.args.get("hub.mode") == "subscribe" and request.args.get("hub.verify_token") == VERIFY_TOKEN:
+        if (request.args.get("hub.mode") == "subscribe" and
+            request.args.get("hub.verify_token") == VERIFY_TOKEN):
             return request.args.get("hub.challenge"), 200
         return "Verification failed", 403
 
@@ -161,9 +159,11 @@ def webhook():
 
     msg = entry[0]["changes"][0]["value"].get("messages", [{}])[0]
     phone = msg.get("from")
+
     if not phone:
         return "OK", 200
 
+    # Only handle text messages here (no images/docs/files)
     text = msg.get("text", {}).get("body", "").strip()
     if not text:
         return "OK", 200
@@ -171,7 +171,7 @@ def webhook():
     user = get_or_create_user(phone)
     now = datetime.utcnow()
 
-    # Onboard user name if unknown
+    # Onboarding: ask for full name if unknown
     if user["name"] is None:
         if len(text.split()) >= 2:
             first_name = text.split()[0]
@@ -181,16 +181,7 @@ def webhook():
             send_text(phone, "Please share your full name (first and last).")
         return "OK", 200
 
-    # Greet user ONLY if user input is greeting and hasn't been greeted before in this session
-    sess = ensure_session(phone)
-    greeted_flag = sess.get("greeted", False)
-    if is_greeting(text) and not greeted_flag:
-        first_name = user["name"].split()[0]
-        send_text(phone, f"Hello, {first_name}! What would you like to study today?")
-        sess["greeted"] = True
-        return "OK", 200
-
-    # Credits reset and usage decrement for free users
+    # Credits reset & check
     if user["account_type"] == "free":
         rt = user["credit_reset"]
         if hasattr(rt, "to_datetime"):
@@ -213,35 +204,22 @@ def webhook():
             if bid == "understood":
                 send_text(phone, "Great—what’s next?")
             elif bid == "explain_more" and user.get("last_prompt"):
-                more = get_gemini(user["last_prompt"] + "\n\nPlease explain in more detail.")
-                clean_more = strip_fences(more)
-                send_text(phone, clean_more)
+                more = get_gemini_response(user["last_prompt"] + "\n\nPlease explain in more detail.")[1]
+                send_text(phone, more)
                 send_buttons(phone)
         return "OK", 200
 
-    # Normal text message handling
+    # Normal text flow
+    sess = ensure_session(phone)
     history = list(sess["history"])
     sess["history"].append(text)
 
     prompt = build_prompt(user, history, text)
-    raw = get_gemini(prompt)
-    clean = strip_fences(raw)
+    rtype, content = get_gemini_response(prompt)
 
-    try:
-        j = json.loads(clean)
-        rtype = j.get("type")
-        content = j.get("content", "")
-    except Exception:
-        rtype = "answer"
-        content = clean
-
-    if not isinstance(content, str):
-        content = str(content)
-
-    # Send ONLY the content string, no JSON dump
     send_text(phone, content)
 
-    # Send buttons ONLY if type is "answer" (academic answers)
+    # Send buttons only if the type is "answer" (academic solving)
     if rtype == "answer":
         send_buttons(phone)
 
