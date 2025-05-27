@@ -40,16 +40,10 @@ db = firestore.client()
 
 BASE_PROMPT = """
 You are a friendly academic tutor.
-Always respond with JSON ONLY: {"type": "clarification" | "answer", "content": "..."}  
-Rules:
-1. If the user’s name is unknown, type="clarification" and ask:  
-   "Please share your full name (first and last)."  
-2. If the user has described their assignment in sufficient detail  
-   (for example they mention “essay 10 lines global warming,” a math problem, etc.),  
-   default to type="answer" and deliver the complete response—they shouldn’t have to clarify.  
-3. Only ask a clarifying question (type="clarification") if the user’s request truly lacks key details.  
-4. Answers must be step-by-step academic guidance (no more than three sentences per step).  
-5. Do NOT include interactive instructions in "content"—buttons are appended by the system when type="answer".
+Always respond with JSON ONLY: {"type": "clarification" | "answer", "content": "..."}
+If the user provides enough details about their assignment or topic, directly answer (type="answer") without asking further.
+Only ask a clarifying question (type="clarification") if truly ambiguous.
+Provide step-by-step academic guidance (≤3 sentences per step).
 """
 
 app = Flask(__name__)
@@ -62,32 +56,42 @@ def ensure_session(phone):
 
 def safe_post(url, payload):
     try:
-        r = requests.post(url,
-                          headers={"Authorization":f"Bearer {ACCESS_TOKEN}",
-                                   "Content-Type":"application/json"},
-                          json=payload)
+        r = requests.post(
+            url,
+            headers={
+                "Authorization": f"Bearer {ACCESS_TOKEN}",
+                "Content-Type": "application/json"
+            },
+            json=payload
+        )
         if r.status_code != 200:
             logger.error(f"WhatsApp API {r.status_code}: {r.text}")
     except Exception:
         logger.exception("Failed WhatsApp send")
 
 def send_text(phone, text):
-    safe_post(f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages", {
-        "messaging_product":"whatsapp","to":phone,
-        "type":"text","text":{"body":text}
-    })
+    safe_post(
+        f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages",
+        {"messaging_product": "whatsapp", "to": phone, "type": "text", "text": {"body": text}}
+    )
 
 def send_buttons(phone):
-    safe_post(f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages", {
-        "messaging_product":"whatsapp","to":phone,
-        "type":"interactive","interactive":{
-            "type":"button","body":{"text":"Did that make sense to you?"},
-            "action":{"buttons":[
-                {"type":"reply","reply":{"id":"understood","title":"Understood"}},
-                {"type":"reply","reply":{"id":"explain_more","title":"Explain more"}}
-            ]}
+    safe_post(
+        f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages",
+        {
+            "messaging_product": "whatsapp",
+            "to": phone,
+            "type": "interactive",
+            "interactive": {
+                "type": "button",
+                "body": {"text": "Did that make sense to you?"},
+                "action": {"buttons": [
+                    {"type":"reply","reply":{"id":"understood","title":"Understood"}},
+                    {"type":"reply","reply":{"id":"explain_more","title":"Explain more"}}
+                ]}
+            }
         }
-    })
+    )
 
 def strip_fences(s):
     s = s.strip()
@@ -100,7 +104,10 @@ def get_gemini(prompt):
         return model.generate_content(prompt).text.strip()
     except Exception:
         logger.exception("Gemini error")
-        return json.dumps({"type":"clarification","content":"Sorry, I encountered an error. Please try again."})
+        return json.dumps({
+            "type": "clarification",
+            "content": "Sorry, I encountered an error. Please try again."
+        })
 
 def get_or_create_user(phone):
     ref = db.collection("users").document(phone)
@@ -134,29 +141,28 @@ def build_prompt(user, history, text):
         f'Current message: "{text}"\nJSON:'
     )
 
-@app.route("/webhook", methods=["GET","POST"])
+@app.route("/webhook", methods=["GET", "POST"])
 def webhook():
     if request.method == "GET":
-        if (request.args.get("hub.mode")=="subscribe"
-            and request.args.get("hub.verify_token")==VERIFY_TOKEN):
+        if (request.args.get("hub.mode") == "subscribe" and
+            request.args.get("hub.verify_token") == VERIFY_TOKEN):
             return request.args.get("hub.challenge"), 200
         return "Verification failed", 403
 
-    data  = request.json or {}
+    data = request.json or {}
     entry = data.get("entry", [])
     if not entry or not entry[0].get("changes"):
         return "OK", 200
 
-    msg   = entry[0]["changes"][0]["value"].get("messages",[{}])[0]
+    msg   = entry[0]["changes"][0]["value"].get("messages", [{}])[0]
     phone = msg.get("from")
-    text  = msg.get("text",{}).get("body","").strip()
+    text  = msg.get("text", {}).get("body", "").strip()
     if not phone or not text:
         return "OK", 200
 
     user = get_or_create_user(phone)
     now  = datetime.utcnow()
 
-    # Onboarding
     if user["name"] is None:
         if len(text.split()) >= 2:
             update_user(phone, name=text)
@@ -165,11 +171,12 @@ def webhook():
             send_text(phone, "Please share your full name (first and last).")
         return "OK", 200
 
-    # Credit reset & usage
     if user["account_type"] == "free":
         rt = user["credit_reset"]
-        if hasattr(rt,"to_datetime"): rt = rt.to_datetime()
-        if isinstance(rt, datetime) and rt.tzinfo: rt = rt.replace(tzinfo=None)
+        if hasattr(rt, "to_datetime"):
+            rt = rt.to_datetime()
+        if isinstance(rt, datetime) and rt.tzinfo:
+            rt = rt.replace(tzinfo=None)
         if now >= rt:
             update_user(phone, credit_remaining=20, credit_reset=now + timedelta(days=1))
             user["credit_remaining"] = 20
@@ -178,10 +185,9 @@ def webhook():
             return "OK", 200
         update_user(phone, credit_remaining=user["credit_remaining"] - 1)
 
-    # Interactive buttons responses
     if msg.get("type") == "interactive":
-        ir = msg.get("interactive",{})
-        if ir.get("type")=="button_reply":
+        ir = msg.get("interactive", {})
+        if ir.get("type") == "button_reply":
             btn = ir["button_reply"]["id"]
             if btn == "understood":
                 send_text(phone, "Fantastic! 🎉 What’s next?")
@@ -191,12 +197,10 @@ def webhook():
                 send_buttons(phone)
         return "OK", 200
 
-    # Maintain last-5 history
-    sess = ensure_session(phone)
+    sess    = ensure_session(phone)
     history = list(sess["history"])
     sess["history"].append(text)
 
-    # Build & call Gemini
     prompt = build_prompt(user, history, text)
     raw    = get_gemini(prompt)
     clean  = strip_fences(raw)
@@ -204,11 +208,15 @@ def webhook():
     try:
         j = json.loads(clean)
         typ = j.get("type")
-        content = j.get("content","")
+        content = j.get("content", "")
     except Exception:
         logger.error(f"JSON parse failed: {clean}")
         typ = "answer"
         content = clean
+
+    # Ensure content is a string
+    if not isinstance(content, str):
+        content = str(content)
 
     send_text(phone, content)
     if typ == "answer":
