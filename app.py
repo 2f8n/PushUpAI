@@ -13,21 +13,15 @@ from flask import Flask, request
 import firebase_admin
 from firebase_admin import credentials, firestore
 
-# Point to the service-account JSON that Render has mounted
-# and explicitly tell Admin SDK your project ID.
+# Service-account JSON (already mounted under this path)
 cred_path = os.getenv(
     "GOOGLE_APPLICATION_CREDENTIALS",
     "studymate-ai-9197f-firebase-adminsdk-fbsvc-5a52d9ff48.json"
 )
 project_id = os.getenv("PROJECT_ID", None)
 
-# Initialize the default app with both credentials and project ID
 cred = credentials.Certificate(cred_path)
-firebase_admin.initialize_app(cred, {
-    "projectId": project_id
-})
-
-# Get Firestore client from the Admin SDK
+firebase_admin.initialize_app(cred, {"projectId": project_id})
 db = firestore.client()
 
 
@@ -35,12 +29,13 @@ db = firestore.client()
 app = Flask(__name__)
 
 VERIFY_TOKEN      = os.getenv("VERIFY_TOKEN", "pushupai_verify_token")
-WHATSAPP_TOKEN    = os.getenv("WHATSAPP_TOKEN", "")
-WHATSAPP_PHONE_ID = os.getenv("WHATSAPP_PHONE_ID", "")
+WHATSAPP_TOKEN    = os.getenv("ACCESS_TOKEN", "")
+WHATSAPP_PHONE_ID = os.getenv("PHONE_NUMBER_ID", "")
+
 
 # === Gemini (GenAI) setup ===
 import google.generativeai as genai
-GENAI_API_KEY = os.getenv("GENAI_API_KEY", "")
+GENAI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 genai.configure(api_key=GENAI_API_KEY)
 model = genai.GenerativeModel("gemini-1.5-pro-002")
 
@@ -139,16 +134,15 @@ def webhook():
     msg = entry["messages"][0]
     phone = msg["from"]
     text = msg.get("text", {}).get("body", "").strip()
-
     user = get_or_create_user(phone)
 
-    # a) Welcome-back on simple greeting
+    # a) Welcome-back on greeting
     if user.get("name") and text.lower() in ("hi", "hello", "hey"):
         first = user["name"].split()[0]
         send_whatsapp_message(phone, f"Welcome back, {first}! 🎓 What would you like to study today?")
         return "OK", 200
 
-    # b) Onboard new user (collect full name)
+    # b) Collect full name for new users
     if not user.get("name"):
         if len(text.split()) >= 2:
             update_user(phone, name=text)
@@ -157,7 +151,7 @@ def webhook():
             send_whatsapp_message(phone, "Please share your full name (first and last). 📖")
         return "OK", 200
 
-    # c) Reject non-academic / identity requests
+    # c) Reject non-academic / identity queries
     if not text or text.lower().startswith("who am i"):
         send_whatsapp_message(phone, "I only answer academic study questions. What topic are you curious about?")
         return "OK", 200
@@ -176,7 +170,7 @@ def webhook():
                 send_interactive_buttons(phone)
                 return "OK", 200
 
-    # e) Credit management for free users
+    # e) Free-user credit management
     if user.get("account_type") == "free":
         rt = user.get("credit_reset")
         if hasattr(rt, "to_datetime"):
