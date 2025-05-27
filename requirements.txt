@@ -7,5 +7,7 @@ pytest
 python-dotenv
 google-cloud-vision>=3.6.0
 PyPDF2>=3.0.1
-google-oauth2-service-account
+google-auth>=2.0.0
+google-auth-httplib2
+google-cloud-vision>=3.10.1
 google-generativeai
