@@ -1,0 +1,14 @@
+[
+  {
+    "question": "What is the derivative of sin(x)?",
+    "expected": "Step 1: Recall that d/dx [sin(x)] = cos(x)."
+  },
+  {
+    "question": "Solve 2x + 3 = 7",
+    "expected": "Step 1: Subtract 3: 2x = 4. Step 2: Divide by 2: x = 2."
+  },
+  {
+    "question": "Factor x² – 5x + 6",
+    "expected": "Step 1: Find two numbers that multiply to 6 and add to –5: –2 and –3. Step 2: Write (x – 2)(x – 3)."
+  }
+]
