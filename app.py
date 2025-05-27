@@ -5,6 +5,7 @@ StudyMate AI: WhatsApp-based academic tutor using Flask, Firebase Admin & Gemini
 
 import os
 import re
+import json
 import requests
 from datetime import datetime, timedelta
 from flask import Flask, request
@@ -13,59 +14,43 @@ from flask import Flask, request
 import firebase_admin
 from firebase_admin import credentials, firestore
 
-# Load service-account JSON from the path Render mounts
+# 1) Path to your service-account JSON (mounted by Render)
 cred_path = os.getenv(
     "GOOGLE_APPLICATION_CREDENTIALS",
-    "studymate-ai-9197f-firebase-adminsdk-fbsvc-5a52d9ff48.json"
+    "/etc/secrets/studymate-ai-9197f-firebase-adminsdk-fbsvc-5a52d9ff48.json"
 )
-# Read your Firebase Project ID
+
+# 2) Your Firebase Project ID
 project_id = os.getenv("PROJECT_ID")
 
-# Initialize Admin SDK with both credentials and project ID
+# Initialize the Admin SDK with both credentials and project ID
 cred = credentials.Certificate(cred_path)
 firebase_admin.initialize_app(cred, {"projectId": project_id})
 db = firestore.client()
 
+
 # === Flask & WhatsApp setup ===
 app = Flask(__name__)
 
-# These names match the vars you set in Render’s dashboard
-VERIFY_TOKEN      = os.getenv("VERIFY_TOKEN", "pushupai_verify_token")
-WHATSAPP_TOKEN    = os.getenv("ACCESS_TOKEN", "")
-WHATSAPP_PHONE_ID = os.getenv("PHONE_NUMBER_ID", "")
+VERIFY_TOKEN      = os.getenv("VERIFY_TOKEN")
+WHATSAPP_TOKEN    = os.getenv("ACCESS_TOKEN")       # Your permanent WhatsApp token
+WHATSAPP_PHONE_ID = os.getenv("PHONE_NUMBER_ID")    # WhatsApp Cloud phone number ID
 
-# === Google Gemini (GenAI) setup ===
+
+# === Gemini (Google Generative AI) setup ===
 import google.generativeai as genai
-GENAI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GENAI_API_KEY = os.getenv("GEMINI_API_KEY")
 genai.configure(api_key=GENAI_API_KEY)
 model = genai.GenerativeModel("gemini-1.5-pro-002")
 
 
-# === Firestore helper functions ===
-
-def get_or_create_user(phone: str) -> dict:
-    doc = db.collection("users").document(phone).get()
-    if not doc.exists:
-        user = {
-            "phone": phone,
-            "name": None,
-            "date_joined": firestore.SERVER_TIMESTAMP,
-            "last_prompt": None,
-            "account_type": "free",
-            "credit_remaining": 20,
-            "credit_reset": datetime.utcnow() + timedelta(days=1)
-        }
-        db.collection("users").document(phone).set(user)
-        return user
-    return doc.to_dict()
+# === Simple debug printer ===
+def log(label, obj=None):
+    payload = json.dumps(obj, ensure_ascii=False) if obj is not None else ""
+    print(f"[DEBUG] {label}: {payload}")
 
 
-def update_user(phone: str, **fields):
-    db.collection("users").document(phone).update(fields)
-
-
-# === WhatsApp messaging helpers ===
-
+# === WhatsApp helpers ===
 def send_whatsapp_message(phone: str, text: str):
     url = f"https://graph.facebook.com/v19.0/{WHATSAPP_PHONE_ID}/messages"
     headers = {
@@ -78,7 +63,14 @@ def send_whatsapp_message(phone: str, text: str):
         "type": "text",
         "text": {"body": text}
     }
-    requests.post(url, headers=headers, json=payload)
+    log("→ WhatsApp API REQUEST", {"url": url, "payload": payload})
+    resp = requests.post(url, headers=headers, json=payload)
+    try:
+        body = resp.json()
+    except ValueError:
+        body = resp.text
+    log("← WhatsApp API RESPONSE", {"status": resp.status_code, "body": body})
+    return resp
 
 
 def send_interactive_buttons(phone: str):
@@ -103,67 +95,94 @@ def send_interactive_buttons(phone: str):
         "type": "interactive",
         "interactive": interactive
     }
-    requests.post(url, headers=headers, json=payload)
+    log("→ WhatsApp API BUTTONS REQUEST", {"url": url, "payload": payload})
+    resp = requests.post(url, headers=headers, json=payload)
+    log("← WhatsApp API BUTTONS RESPONSE", {"status": resp.status_code, "body": resp.text})
+    return resp
+
+
+# === Firestore helpers ===
+def get_or_create_user(phone: str) -> dict:
+    doc_ref = db.collection("users").document(phone)
+    doc = doc_ref.get()
+    if not doc.exists:
+        user = {
+            "phone": phone,
+            "name": None,
+            "date_joined": firestore.SERVER_TIMESTAMP,
+            "last_prompt": None,
+            "account_type": "free",
+            "credit_remaining": 20,
+            "credit_reset": datetime.utcnow() + timedelta(days=1)
+        }
+        doc_ref.set(user)
+        return user
+    return doc.to_dict()
+
+
+def update_user(phone: str, **fields):
+    db.collection("users").document(phone).update(fields)
 
 
 # === Gemini prompt helper ===
-
 def strip_greeting(text: str) -> str:
     return re.sub(r'^(hi|hello|hey)[^\n]*\n?', '', text, flags=re.IGNORECASE).strip()
 
 
 def get_gemini_reply(prompt: str) -> str:
+    log("→ Gemini prompt", {"prompt": prompt})
     response = model.generate_content(prompt)
-    return strip_greeting(response.text.strip())
+    text = strip_greeting(response.text.strip())
+    log("← Gemini reply", {"reply": text})
+    return text
 
 
 # === Webhook endpoint ===
-
 @app.route("/webhook", methods=["GET", "POST"])
 def webhook():
-    # 1) Verify handshake
+    # Verification handshake
     if request.method == "GET":
-        if (
-            request.args.get("hub.mode") == "subscribe" and
-            request.args.get("hub.verify_token") == VERIFY_TOKEN
-        ):
+        if request.args.get("hub.mode") == "subscribe" and request.args.get("hub.verify_token") == VERIFY_TOKEN:
             return request.args.get("hub.challenge"), 200
         return "Verification failed", 403
 
-    # 2) Process incoming messages
+    # Process incoming WhatsApp messages
     data = request.get_json(force=True)
+    log("← Incoming webhook payload", data)
+
     entry = data["entry"][0]["changes"][0]["value"]
     if "messages" not in entry:
         return "OK", 200
 
-    msg = entry["messages"][0]
+    msg   = entry["messages"][0]
     phone = msg["from"]
-    text = msg.get("text", {}).get("body", "").strip()
-    user = get_or_create_user(phone)
+    text  = msg.get("text", {}).get("body", "").strip()
+    user  = get_or_create_user(phone)
 
-    # a) Welcome back on simple greeting
+    # 1) Welcome-back
     if user.get("name") and text.lower() in ("hi", "hello", "hey"):
         first = user["name"].split()[0]
         send_whatsapp_message(phone, f"Welcome back, {first}! 🎓 What would you like to study today?")
         return "OK", 200
 
-    # b) Onboard new users (collect full name)
+    # 2) Onboard new user (collect name)
     if not user.get("name"):
         if len(text.split()) >= 2:
             update_user(phone, name=text)
-            send_whatsapp_message(phone, f"Nice to meet you, {text}! 🎓 What topic shall we study?")
+            reply = f"Nice to meet you, {text}! 🎓 What topic shall we study?"
         else:
-            send_whatsapp_message(phone, "Please share your full name (first and last). 📖")
+            reply = "Please share your *full* name (first and last). 📖"
+        send_whatsapp_message(phone, reply)
         return "OK", 200
 
-    # c) Reject non-academic / identity queries
+    # 3) Reject non-academic / identity queries
     if not text or text.lower().startswith("who am i"):
         send_whatsapp_message(phone, "I only answer academic study questions. What topic are you curious about?")
         return "OK", 200
 
-    # d) Handle interactive button replies
+    # 4) Handle interactive button replies
     if msg.get("type") == "interactive":
-        ir = msg.get("interactive")
+        ir = msg.get("interactive", {})
         if ir.get("type") == "button_reply":
             pid = ir["button_reply"]["id"]
             if pid == "understood":
@@ -175,7 +194,7 @@ def webhook():
                 send_interactive_buttons(phone)
                 return "OK", 200
 
-    # e) Credit management for free tier
+    # 5) Credit management (free-tier)
     if user.get("account_type") == "free":
         rt = user.get("credit_reset")
         if hasattr(rt, "to_datetime"):
@@ -188,7 +207,7 @@ def webhook():
             return "OK", 200
         update_user(phone, credit_remaining=user["credit_remaining"] - 1)
 
-    # f) Academic Q&A flow
+    # 6) Academic Q&A flow
     prompt = (
         f"You are StudyMate AI, an academic tutor by ByteWave Media. "
         f"Answer the question below with clear, step-by-step academic explanations only. "
