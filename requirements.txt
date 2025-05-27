@@ -6,3 +6,4 @@ google-generativeai
 pytest
 python-dotenv
 google-cloud-vision>=3.6.0
+PyPDF2
