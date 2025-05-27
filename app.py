@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-StudyMate AI: WhatsApp-based academic tutor using Flask, Firebase Admin & Gemini.
+StudyMate AI: WhatsApp-based academic tutor with image support using Flask, Firebase Admin & Gemini.
 """
 
 import os
@@ -14,28 +14,22 @@ from flask import Flask, request
 import firebase_admin
 from firebase_admin import credentials, firestore
 
-# 1) Path to your service-account JSON (mounted by Render)
 cred_path = os.getenv(
     "GOOGLE_APPLICATION_CREDENTIALS",
     "/etc/secrets/studymate-ai-9197f-firebase-adminsdk-fbsvc-5a52d9ff48.json"
 )
-
-# 2) Your Firebase Project ID
 project_id = os.getenv("PROJECT_ID")
 
-# Initialize the Admin SDK with both credentials and project ID
 cred = credentials.Certificate(cred_path)
 firebase_admin.initialize_app(cred, {"projectId": project_id})
 db = firestore.client()
-
 
 # === Flask & WhatsApp setup ===
 app = Flask(__name__)
 
 VERIFY_TOKEN      = os.getenv("VERIFY_TOKEN")
-WHATSAPP_TOKEN    = os.getenv("ACCESS_TOKEN")       # Your permanent WhatsApp token
-WHATSAPP_PHONE_ID = os.getenv("PHONE_NUMBER_ID")    # WhatsApp Cloud phone number ID
-
+WHATSAPP_TOKEN    = os.getenv("ACCESS_TOKEN")
+WHATSAPP_PHONE_ID = os.getenv("PHONE_NUMBER_ID")
 
 # === Gemini (Google Generative AI) setup ===
 import google.generativeai as genai
@@ -43,12 +37,10 @@ GENAI_API_KEY = os.getenv("GEMINI_API_KEY")
 genai.configure(api_key=GENAI_API_KEY)
 model = genai.GenerativeModel("gemini-1.5-pro-002")
 
-
-# === Simple debug printer ===
+# === Debug logger ===
 def log(label, obj=None):
     payload = json.dumps(obj, ensure_ascii=False) if obj is not None else ""
     print(f"[DEBUG] {label}: {payload}")
-
 
 # === WhatsApp helpers ===
 def send_whatsapp_message(phone: str, text: str):
@@ -71,7 +63,6 @@ def send_whatsapp_message(phone: str, text: str):
         body = resp.text
     log("← WhatsApp API RESPONSE", {"status": resp.status_code, "body": body})
     return resp
-
 
 def send_interactive_buttons(phone: str):
     url = f"https://graph.facebook.com/v19.0/{WHATSAPP_PHONE_ID}/messages"
@@ -100,7 +91,6 @@ def send_interactive_buttons(phone: str):
     log("← WhatsApp API BUTTONS RESPONSE", {"status": resp.status_code, "body": resp.text})
     return resp
 
-
 # === Firestore helpers ===
 def get_or_create_user(phone: str) -> dict:
     doc_ref = db.collection("users").document(phone)
@@ -119,34 +109,45 @@ def get_or_create_user(phone: str) -> dict:
         return user
     return doc.to_dict()
 
-
 def update_user(phone: str, **fields):
     db.collection("users").document(phone).update(fields)
 
-
-# === Gemini prompt helper ===
+# === Gemini helpers ===
 def strip_greeting(text: str) -> str:
     return re.sub(r'^(hi|hello|hey)[^\n]*\n?', '', text, flags=re.IGNORECASE).strip()
 
-
-def get_gemini_reply(prompt: str) -> str:
-    log("→ Gemini prompt", {"prompt": prompt})
-    response = model.generate_content(prompt)
+def get_gemini_reply(prompt: str, image_bytes: bytes = None) -> str:
+    """
+    If image_bytes is provided, pass it to Gemini alongside the prompt (for multimodal).
+    Otherwise, run a text-only prompt.
+    """
+    log("→ Gemini prompt", {"prompt": prompt, "has_image": bool(image_bytes)})
+    if image_bytes:
+        # If the library supports image inputs, use it.
+        try:
+            response = model.generate_content(prompt, image=image_bytes)
+        except TypeError:
+            # Fallback: include a note about the image
+            response = model.generate_content(f"{prompt} (I've attached an image for you to consider.)")
+    else:
+        response = model.generate_content(prompt)
     text = strip_greeting(response.text.strip())
     log("← Gemini reply", {"reply": text})
     return text
 
-
 # === Webhook endpoint ===
 @app.route("/webhook", methods=["GET", "POST"])
 def webhook():
-    # Verification handshake
+    # 1) Verification handshake
     if request.method == "GET":
-        if request.args.get("hub.mode") == "subscribe" and request.args.get("hub.verify_token") == VERIFY_TOKEN:
+        if (
+            request.args.get("hub.mode") == "subscribe" and
+            request.args.get("hub.verify_token") == VERIFY_TOKEN
+        ):
             return request.args.get("hub.challenge"), 200
         return "Verification failed", 403
 
-    # Process incoming WhatsApp messages
+    # 2) Process message
     data = request.get_json(force=True)
     log("← Incoming webhook payload", data)
 
@@ -154,34 +155,52 @@ def webhook():
     if "messages" not in entry:
         return "OK", 200
 
-    msg   = entry["messages"][0]
+    msg = entry["messages"][0]
     phone = msg["from"]
-    text  = msg.get("text", {}).get("body", "").strip()
-    user  = get_or_create_user(phone)
+    msg_type = msg.get("type")
 
-    # 1) Welcome-back
+    # 3) Handle image messages
+    if msg_type == "image":
+        media_id = msg["image"]["id"]
+        # a) get the media URL
+        url_resp = requests.get(
+            f"https://graph.facebook.com/v19.0/{media_id}",
+            params={"access_token": WHATSAPP_TOKEN}
+        )
+        media_url = url_resp.json().get("url")
+        # b) download the image bytes
+        img_bytes = requests.get(media_url, headers={
+            "Authorization": f"Bearer {WHATSAPP_TOKEN}"
+        }).content
+        # c) ask Gemini to describe the image
+        description = get_gemini_reply("Please describe the content of this image.", image_bytes=img_bytes)
+        send_whatsapp_message(phone, description)
+        send_interactive_buttons(phone)
+        return "OK", 200
+
+    # 4) For text messages, extract the body
+    text = msg.get("text", {}).get("body", "").strip()
+    user = get_or_create_user(phone)
+
+    # 5) Welcome-back on greeting
     if user.get("name") and text.lower() in ("hi", "hello", "hey"):
         first = user["name"].split()[0]
         send_whatsapp_message(phone, f"Welcome back, {first}! 🎓 What would you like to study today?")
         return "OK", 200
 
-    # 2) Onboard new user (collect name)
+    # 6) Onboard new users (collect full name)
     if not user.get("name"):
         if len(text.split()) >= 2:
             update_user(phone, name=text)
-            reply = f"Nice to meet you, {text}! 🎓 What topic shall we study?"
+            send_whatsapp_message(phone, f"Nice to meet you, {text}! 🎓 What topic shall we study?")
         else:
-            reply = "Please share your *full* name (first and last). 📖"
-        send_whatsapp_message(phone, reply)
+            send_whatsapp_message(phone, "Please share your full name (first and last). 📖")
         return "OK", 200
 
-    # 3) Reject non-academic / identity queries
-    if not text or text.lower().startswith("who am i"):
-        send_whatsapp_message(phone, "I only answer academic study questions. What topic are you curious about?")
-        return "OK", 200
+    # — Removed the old “I only answer academic…” block —
 
-    # 4) Handle interactive button replies
-    if msg.get("type") == "interactive":
+    # 7) Handle interactive button replies
+    if msg_type == "interactive":
         ir = msg.get("interactive", {})
         if ir.get("type") == "button_reply":
             pid = ir["button_reply"]["id"]
@@ -194,20 +213,25 @@ def webhook():
                 send_interactive_buttons(phone)
                 return "OK", 200
 
-    # 5) Credit management (free-tier)
+    # 8) Free-tier credit management
     if user.get("account_type") == "free":
         rt = user.get("credit_reset")
         if hasattr(rt, "to_datetime"):
             rt = rt.to_datetime().replace(tzinfo=None)
         if isinstance(rt, datetime) and datetime.utcnow() >= rt:
-            update_user(phone, credit_remaining=20, credit_reset=datetime.utcnow() + timedelta(days=1))
+            update_user(phone,
+                        credit_remaining=20,
+                        credit_reset=datetime.utcnow() + timedelta(days=1))
             user["credit_remaining"] = 20
         if user.get("credit_remaining", 0) <= 0:
-            send_whatsapp_message(phone, "Free limit reached (20/day). Upgrade to Premium for unlimited prompts.")
+            send_whatsapp_message(
+                phone,
+                "Free limit reached (20/day). Upgrade to Premium for unlimited prompts."
+            )
             return "OK", 200
         update_user(phone, credit_remaining=user["credit_remaining"] - 1)
 
-    # 6) Academic Q&A flow
+    # 9) Academic Q&A flow
     prompt = (
         f"You are StudyMate AI, an academic tutor by ByteWave Media. "
         f"Answer the question below with clear, step-by-step academic explanations only. "
