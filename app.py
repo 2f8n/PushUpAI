@@ -107,6 +107,7 @@ def get_gemini(prompt):
         return model.generate_content(prompt).text.strip()
     except Exception:
         logger.exception("Gemini error")
+        # Return safe JSON string for fallback
         return json.dumps({"type": "clarification", "content": "Sorry, I encountered an error. Please try again."})
 
 def get_or_create_user(phone):
@@ -128,6 +129,11 @@ def get_or_create_user(phone):
 def update_user(phone, **fields):
     db.collection("users").document(phone).update(fields)
     logger.info(f"Updated {phone}: {fields}")
+
+def is_greeting(text):
+    greetings = ["hi", "hello", "hey", "good morning", "good afternoon", "good evening", "hiya", "yo", "greetings"]
+    text_lower = text.lower()
+    return any(g in text_lower for g in greetings)
 
 def build_prompt(user, history, message):
     parts = [SYSTEM_PROMPT]
@@ -175,6 +181,15 @@ def webhook():
             send_text(phone, "Please share your full name (first and last).")
         return "OK", 200
 
+    # Greet user ONLY if user input is greeting and hasn't been greeted before in this session
+    sess = ensure_session(phone)
+    greeted_flag = sess.get("greeted", False)
+    if is_greeting(text) and not greeted_flag:
+        first_name = user["name"].split()[0]
+        send_text(phone, f"Hello, {first_name}! What would you like to study today?")
+        sess["greeted"] = True
+        return "OK", 200
+
     # Credits reset and usage decrement for free users
     if user["account_type"] == "free":
         rt = user["credit_reset"]
@@ -205,7 +220,6 @@ def webhook():
         return "OK", 200
 
     # Normal text message handling
-    sess = ensure_session(phone)
     history = list(sess["history"])
     sess["history"].append(text)
 
@@ -224,12 +238,16 @@ def webhook():
     if not isinstance(content, str):
         content = str(content)
 
+    # Send ONLY the content string, no JSON dump
     send_text(phone, content)
+
+    # Send buttons ONLY if type is "answer" (academic answers)
     if rtype == "answer":
         send_buttons(phone)
 
     update_user(phone, last_prompt=prompt)
     return "OK", 200
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=PORT)
