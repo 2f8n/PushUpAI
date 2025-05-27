@@ -3,24 +3,21 @@
 StudyMate AI: WhatsApp tutor with fully dynamic NLU and ephemeral session context.
 Features:
  - Onboarding (name collection)
- - Dynamic subject/topic extraction via Gemini for every message
+ - Dynamic subject/topic extraction via Gemini with JSON cleaning + fallback
  - In-memory session store (no persistent subject/topic)
- - Credit management (free vs. premium)
+ - Free vs. Premium credit management
  - Interactive “Understood” / “Explain more” buttons
- - Robust error handling and logging
+ - Robust error handling, logging
 """
 
-# 1) Load environment (from .env locally or Render dashboard)
+# 1) Load environment (locally via .env or from Render dashboard)
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
     pass
 
-import os
-import re
-import json
-import logging
+import os, re, json, logging
 from datetime import datetime, timedelta
 
 import requests
@@ -49,7 +46,7 @@ PORT            = int(os.getenv("PORT", 10000))
 missing = [k for k in ("VERIFY_TOKEN","ACCESS_TOKEN","PHONE_NUMBER_ID","GEMINI_API_KEY") if not os.getenv(k)]
 if missing:
     logger.error(f"Missing environment variables: {', '.join(missing)}")
-    raise SystemExit("Set all required environment variables.")
+    raise SystemExit("Please set all required environment variables.")
 
 # 5) Gemini init
 genai.configure(api_key=GEMINI_API_KEY)
@@ -68,17 +65,18 @@ with open("studymate_prompt.txt", "r") as f:
     BASE_PROMPT = f.read().strip()
 
 # 8) In-memory session store
-#    sessions[phone] = {"subject": str|None, "topic": str|None, "expiry": datetime}
-sessions = {}
+sessions = {}  # phone -> {"subject":..., "topic":..., "expiry": datetime}
 
-# 9) Helper functions
+# — Helpers —
 
 def safe_post(url: str, payload: dict):
     try:
-        resp = requests.post(url,
+        resp = requests.post(
+            url,
             headers={"Authorization": f"Bearer {ACCESS_TOKEN}",
                      "Content-Type": "application/json"},
-            json=payload)
+            json=payload
+        )
         if resp.status_code != 200:
             logger.error(f"WhatsApp API {resp.status_code}: {resp.text}")
     except Exception:
@@ -121,24 +119,46 @@ def get_gemini_reply(prompt: str) -> str:
 
 def parse_subject_topic(text: str):
     """
-    Ask Gemini to extract subject & topic.
-    Returns (subject:str|None, topic:str|None).
+    1. Ask Gemini to output JSON {subject, topic}.
+    2. Clean code fences and extract {...}.
+    3. On JSONParseError: fallback to two simple prompts.
     """
     parser_prompt = (
-        "Extract the ACADEMIC subject and SPECIFIC topic from this message.\n"
-        "Respond with JSON: {\"subject\":..., \"topic\":...} (null if missing).\n"
+        "Extract the academic 'subject' and 'topic' from this message.\n"
+        "Respond with JSON ONLY: {\"subject\":..., \"topic\":...} (use null if missing).\n"
         f"User: \"{text}\"\nJSON:"
     )
-    resp = get_gemini_reply(parser_prompt)
+    raw = get_gemini_reply(parser_prompt)
+    # strip backticks or markdown fences
+    cleaned = raw.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```[\w]*|```$", "", cleaned).strip()
+    # extract first {...}
+    m = re.search(r"\{[\s\S]*\}", cleaned)
+    json_str = m.group(0) if m else cleaned
+
     try:
-        data = json.loads(resp)
-        return data.get("subject"), data.get("topic")
-    except Exception:
-        logger.error(f"Parser JSON failed: {resp}")
-        return None, None
+        data = json.loads(json_str)
+        subj = data.get("subject")
+        top  = data.get("topic")
+    except json.JSONDecodeError:
+        logger.warning(f"parse_subject_topic failed to parse JSON: {raw}")
+        # fallback #1: subject-only
+        subj_resp = get_gemini_reply(
+            f"Identify the academic subject from this text: \"{text}\". Reply with subject only."
+        )
+        # fallback #2: topic-only
+        top_resp = get_gemini_reply(
+            f"Identify the specific topic/task from this text: \"{text}\". Reply with topic only or 'null'."
+        )
+        subj = subj_resp.splitlines()[0].strip().strip('"')
+        top  = top_resp.splitlines()[0].strip().strip('"')
+        if subj.lower() == "null": subj = None
+        if top.lower()  == "null": top  = None
+
+    return subj or None, top or None
 
 def get_or_create_user(phone: str) -> dict:
-    # Only name & credits are persistent
     ref = db.collection("users").document(phone)
     doc = ref.get()
     if not doc.exists:
@@ -157,18 +177,17 @@ def update_user(phone: str, **fields):
     db.collection("users").document(phone).update(fields)
     logger.info(f"Updated {phone}: {fields}")
 
-# 10) Webhook endpoint
+# — Webhook —
 
 @app.route("/webhook", methods=["GET","POST"])
 def webhook():
-    # — Verification —
+    # Verification
     if request.method == "GET":
         if (request.args.get("hub.mode")=="subscribe" and
             request.args.get("hub.verify_token")==VERIFY_TOKEN):
             return request.args.get("hub.challenge"), 200
         return "Verification failed", 403
 
-    # — Handle incoming message —
     data = request.json or {}
     entries = data.get("entry", [])
     if not entries or not entries[0].get("changes"):
@@ -183,7 +202,7 @@ def webhook():
     text  = msg.get("text", {}).get("body", "").strip()
     now   = datetime.utcnow()
 
-    # Clear expired session
+    # Expire old session
     sess = sessions.get(phone)
     if sess and now > sess["expiry"]:
         del sessions[phone]
@@ -191,20 +210,18 @@ def webhook():
 
     user = get_or_create_user(phone)
 
-    # — Onboarding name —
+    # 1) Onboarding name
     if not user.get("name"):
         if len(text.split()) >= 2:
             update_user(phone, name=text)
-            # start new session
             sessions[phone] = {"subject":None, "topic":None, "expiry": now + timedelta(hours=2)}
             send_whatsapp_message(phone,
                 f"Nice to meet you, {text}! 🎓 What would you like to study today?")
         else:
-            send_whatsapp_message(phone,
-                "Please share your full name (first and last).")
+            send_whatsapp_message(phone, "Please share your full name (first and last).")
         return "OK", 200
 
-    # — Greeting starts a new session —
+    # 2) Greeting starts new session
     if text.lower() in ("hi","hello","hey"):
         first = user["name"].split()[0]
         sessions[phone] = {"subject":None, "topic":None, "expiry": now + timedelta(hours=2)}
@@ -212,57 +229,39 @@ def webhook():
             f"Welcome back, {first}! 🎓 What would you like to study today?")
         return "OK", 200
 
-    # ensure a session is active
+    # Ensure session
     if phone not in sessions:
         sessions[phone] = {"subject":None, "topic":None, "expiry": now + timedelta(hours=2)}
 
-    # — Dynamic subject/topic parsing —
+    # 3) Dynamic subject/topic parsing
     subj, top = parse_subject_topic(text)
-
-    # If Gemini extracted both
-    if subj and top:
-        sessions[phone]["subject"] = subj
-        sessions[phone]["topic"]   = top
-        sessions[phone]["expiry"]  = now + timedelta(hours=2)
-        send_whatsapp_message(phone,
-            f"Great! We'll focus on *{top}* in *{subj}*. How can I help you with that?")
+    if subj or top:
+        sessions[phone].update({"subject":subj, "topic":top, "expiry": now + timedelta(hours=2)})
+        if subj and top:
+            send_whatsapp_message(phone,
+                f"Great—{top} in {subj}. How can I help with that?")
+        elif subj:
+            send_whatsapp_message(phone,
+                f"Subject set to {subj}. What specific topic or task? (e.g., essay, vocab)")
+        else:
+            send_whatsapp_message(phone,
+                f"Topic set to {top}. Which subject does this belong to? (e.g., English, Math)")
         return "OK", 200
 
-    # If only subject
-    if subj and not sessions[phone]["topic"]:
-        sessions[phone]["subject"] = subj
-        sessions[phone]["expiry"]  = now + timedelta(hours=2)
-        send_whatsapp_message(phone,
-            f"Your subject is *{subj}*. What specific topic or task are you working on? "
-            "(e.g., essay, vocabulary, equations)")
-        return "OK", 200
-
-    # If only topic
-    if top and not sessions[phone]["subject"]:
-        sessions[phone]["topic"]   = top
-        sessions[phone]["expiry"]  = now + timedelta(hours=2)
-        send_whatsapp_message(phone,
-            f"You're working on *{top}*. Which broader subject is this under? "
-            "(e.g., English, Math, Chemistry)")
-        return "OK", 200
-
-    # — Interactive buttons —
+    # 4) Button replies
     if msg.get("type") == "interactive":
         ir = msg.get("interactive", {})
         if ir.get("type") == "button_reply":
             btn = ir["button_reply"]["id"]
             if btn == "understood":
-                send_whatsapp_message(phone,
-                    "Fantastic! 🎉 What’s next on your study list?")
-                return "OK", 200
+                send_whatsapp_message(phone, "Fantastic! 🎉 What’s next?")
             if btn == "explain_more" and user.get("last_prompt"):
-                detail = get_gemini_reply(
-                    user["last_prompt"] + "\n\nPlease explain in more detail.")
+                detail = get_gemini_reply(user["last_prompt"] + "\n\nPlease explain more.")
                 send_whatsapp_message(phone, detail)
                 send_interactive_buttons(phone)
-                return "OK", 200
+            return "OK", 200
 
-    # — Credit reset & usage for free users —
+    # 5) Credit reset & usage
     if user.get("account_type") == "free":
         rt = user.get("credit_reset")
         if hasattr(rt, "to_datetime"):
@@ -270,25 +269,21 @@ def webhook():
         if isinstance(rt, datetime) and rt.tzinfo:
             rt = rt.replace(tzinfo=None)
         if isinstance(rt, datetime) and now >= rt:
-            update_user(phone,
-                        credit_remaining=20,
+            update_user(phone, credit_remaining=20,
                         credit_reset=now + timedelta(days=1))
             user["credit_remaining"] = 20
-        if user.get("credit_remaining", 0) <= 0:
+        if user.get("credit_remaining",0) <= 0:
             send_whatsapp_message(phone,
-                "Free limit reached (20/day). Upgrade for unlimited access.")
+                "Free limit reached (20/day). Upgrade for unlimited usage.")
             return "OK", 200
-        update_user(phone,
-                    credit_remaining=user["credit_remaining"] - 1)
+        update_user(phone, credit_remaining=user["credit_remaining"] - 1)
 
-    # — Academic Q&A (with in-session context) —
+    # 6) Academic Q&A
     subj = sessions[phone]["subject"]
     top  = sessions[phone]["topic"]
     context = ""
-    if subj:
-        context += f"Subject: {subj}. "
-    if top:
-        context += f"Topic: {top}. "
+    if subj: context += f"Subject: {subj}. "
+    if top:  context += f"Topic: {top}. "
 
     prompt = f"{BASE_PROMPT}\n{context}\nQuestion: {text}"
     update_user(phone, last_prompt=prompt)
@@ -296,6 +291,7 @@ def webhook():
     ans = get_gemini_reply(prompt)
     send_whatsapp_message(phone, ans)
     send_interactive_buttons(phone)
+
     return "OK", 200
 
 # 11) Run server
