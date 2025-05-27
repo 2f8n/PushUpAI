@@ -1,10 +1,7 @@
-
----
-
-**`app.py`** (no other changes needed):
-
-```python
-import os, re, json, logging
+import os
+import re
+import json
+import logging
 from collections import deque
 from datetime import datetime, timedelta
 
@@ -23,6 +20,7 @@ try:
 except ImportError:
     pass
 
+# Ensure required env vars
 for v in ("VERIFY_TOKEN", "ACCESS_TOKEN", "PHONE_NUMBER_ID", "GEMINI_API_KEY"):
     if not os.getenv(v):
         logger.error(f"Missing environment variable: {v}")
@@ -37,6 +35,7 @@ PORT            = int(os.getenv("PORT", 10000))
 genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel("gemini-1.5-pro-002")
 
+# Firestore setup
 KEY_FILE    = "studymate-ai-9197f-firebase-adminsdk-fbsvc-5a52d9ff48.json"
 SECRET_PATH = f"/etc/secrets/{KEY_FILE}"
 cred_path   = SECRET_PATH if os.path.exists(SECRET_PATH) else KEY_FILE
@@ -44,11 +43,12 @@ cred        = credentials.Certificate(cred_path)
 firebase_admin.initialize_app(cred)
 db = firestore.client()
 
+# Load system prompt
 with open("studymate_prompt.txt", "r") as f:
     SYSTEM_PROMPT = f.read().strip()
 
 app = Flask(__name__)
-sessions = {}  # phone -> {"history": deque(maxlen=5)}
+sessions = {}  # phone → {"history": deque(maxlen=5)}
 
 def ensure_session(phone):
     if phone not in sessions:
@@ -110,9 +110,14 @@ def get_or_create_user(phone):
     ref = db.collection("users").document(phone)
     doc = ref.get()
     if not doc.exists:
-        user = {"phone": phone, "name": None, "account_type": "free",
-                "credit_remaining": 20, "credit_reset": datetime.utcnow() + timedelta(days=1),
-                "last_prompt": None}
+        user = {
+            "phone": phone,
+            "name": None,
+            "account_type": "free",
+            "credit_remaining": 20,
+            "credit_reset": datetime.utcnow() + timedelta(days=1),
+            "last_prompt": None
+        }
         ref.set(user)
         return user
     return doc.to_dict()
@@ -154,6 +159,7 @@ def webhook():
     user = get_or_create_user(phone)
     now  = datetime.utcnow()
 
+    # Onboarding
     if user["name"] is None:
         if len(text.split()) >= 2:
             first = text.split()[0]
@@ -163,10 +169,13 @@ def webhook():
             send_text(phone, "Please share your full name (first and last).")
         return "OK", 200
 
+    # Credits
     if user["account_type"] == "free":
         rt = user["credit_reset"]
-        if hasattr(rt, "to_datetime"): rt = rt.to_datetime()
-        if isinstance(rt, datetime) and rt.tzinfo: rt = rt.replace(tzinfo=None)
+        if hasattr(rt, "to_datetime"):
+            rt = rt.to_datetime()
+        if isinstance(rt, datetime) and rt.tzinfo:
+            rt = rt.replace(tzinfo=None)
         if now >= rt:
             update_user(phone, credit_remaining=20, credit_reset=now + timedelta(days=1))
             user["credit_remaining"] = 20
@@ -175,6 +184,7 @@ def webhook():
             return "OK", 200
         update_user(phone, credit_remaining=user["credit_remaining"] - 1)
 
+    # Interactive replies
     if msg.get("type") == "interactive":
         ir = msg.get("interactive", {})
         if ir.get("type") == "button_reply":
@@ -200,7 +210,7 @@ def webhook():
         rtype = resp.get("type")
         content = resp.get("content", "")
     except Exception:
-        logger.error(f"JSON parse failed: {clean}")
+        logger.error(f"Failed to parse JSON: {clean}")
         rtype = "answer"
         content = clean
 
