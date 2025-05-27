@@ -10,18 +10,21 @@ from flask import Flask, request
 import firebase_admin
 from firebase_admin import credentials, firestore
 import google.generativeai as genai
+from google.cloud import vision
+import PyPDF2
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s — %(message)s")
 logger = logging.getLogger("StudyMate")
 
-# Load environment variables
+# Load .env if present
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
     pass
 
-for v in ("VERIFY_TOKEN", "ACCESS_TOKEN", "PHONE_NUMBER_ID", "GEMINI_API_KEY"):
+# Required env vars
+for v in ("VERIFY_TOKEN","ACCESS_TOKEN","PHONE_NUMBER_ID","GEMINI_API_KEY","GOOGLE_APPLICATION_CREDENTIALS"):
     if not os.getenv(v):
         logger.error(f"Missing environment variable: {v}")
         raise SystemExit("Please set all required environment variables.")
@@ -30,12 +33,16 @@ VERIFY_TOKEN    = os.getenv("VERIFY_TOKEN")
 ACCESS_TOKEN    = os.getenv("ACCESS_TOKEN")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 GEMINI_API_KEY  = os.getenv("GEMINI_API_KEY")
-PORT            = int(os.getenv("PORT", 10000))
+PORT            = int(os.getenv("PORT",10000))
 
+# Initialize Gemini
 genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel("gemini-1.5-pro-002")
 
-# Firestore for user data
+# Initialize Vision client
+vision_client = vision.ImageAnnotatorClient()
+
+# Firestore setup
 KEY_FILE    = "studymate-ai-9197f-firebase-adminsdk-fbsvc-5a52d9ff48.json"
 SECRET_PATH = f"/etc/secrets/{KEY_FILE}"
 cred_path   = SECRET_PATH if os.path.exists(SECRET_PATH) else KEY_FILE
@@ -44,61 +51,50 @@ firebase_admin.initialize_app(cred)
 db = firestore.client()
 
 # Load system prompt
-with open("studymate_prompt.txt", "r") as f:
+with open("studymate_prompt.txt","r") as f:
     SYSTEM_PROMPT = f.read().strip()
 
 app = Flask(__name__)
-sessions = {}  # phone → {"history": deque(maxlen=5)}
+sessions = {}  # phone -> {"history": deque(maxlen=5)}
 
 def ensure_session(phone):
     if phone not in sessions:
         sessions[phone] = {"history": deque(maxlen=5)}
     return sessions[phone]
 
-def safe_post(url, payload):
+def safe_post(url,payload):
     try:
-        r = requests.post(
-            url,
-            headers={"Authorization": f"Bearer {ACCESS_TOKEN}", "Content-Type": "application/json"},
-            json=payload
-        )
-        if r.status_code not in (200, 201):
+        r = requests.post(url,
+            headers={"Authorization":f"Bearer {ACCESS_TOKEN}",
+                     "Content-Type":"application/json"},
+            json=payload)
+        if r.status_code not in (200,201):
             logger.error(f"WhatsApp API {r.status_code}: {r.text}")
     except Exception:
-        logger.exception("Failed to send WhatsApp message")
+        logger.exception("Failed WhatsApp send")
 
-def send_text(phone, text):
-    # wrap in quotes with one-line margin top/bottom
-    wrapped = f"\n\"{text}\"\n"
-    safe_post(
-        f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages",
-        {"messaging_product": "whatsapp", "to": phone, "type": "text", "text": {"body": wrapped}}
-    )
+def send_text(phone,text):
+    safe_post(f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages",{
+        "messaging_product":"whatsapp","to":phone,
+        "type":"text","text":{"body":text}
+    })
 
 def send_buttons(phone):
-    safe_post(
-        f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages",
-        {
-            "messaging_product": "whatsapp",
-            "to": phone,
-            "type": "interactive",
-            "interactive": {
-                "type": "button",
-                "body": {"text": "Did that make sense to you?"},
-                "action": {
-                    "buttons": [
-                        {"type": "reply", "reply": {"id": "understood", "title": "Understood"}},
-                        {"type": "reply", "reply": {"id": "explain_more", "title": "Explain more"}}
-                    ]
-                }
-            }
+    safe_post(f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages",{
+        "messaging_product":"whatsapp","to":phone,
+        "type":"interactive","interactive":{
+            "type":"button","body":{"text":"Did that make sense to you?"},
+            "action":{"buttons":[
+                {"type":"reply","reply":{"id":"understood","title":"Understood"}},
+                {"type":"reply","reply":{"id":"explain_more","title":"Explain more"}}
+            ]}
         }
-    )
+    })
 
-def strip_fences(text):
-    t = text.strip()
+def strip_fences(t):
+    t = t.strip()
     if t.startswith("```"):
-        t = re.sub(r"^```[\w]*|```$", "", t).strip()
+        t = re.sub(r"^```[\w]*|```$","",t).strip()
     return t
 
 def get_gemini(prompt):
@@ -106,29 +102,25 @@ def get_gemini(prompt):
         return model.generate_content(prompt).text.strip()
     except Exception:
         logger.exception("Gemini error")
-        return json.dumps({"type": "clarification", "content": "Sorry, I encountered an error. Please try again."})
+        return json.dumps({"type":"clarification","content":"Sorry, I encountered an error. Please try again."})
 
 def get_or_create_user(phone):
     ref = db.collection("users").document(phone)
     doc = ref.get()
     if not doc.exists:
-        user = {
-            "phone": phone,
-            "name": None,
-            "account_type": "free",
-            "credit_remaining": 20,
-            "credit_reset": datetime.utcnow() + timedelta(days=1),
-            "last_prompt": None
-        }
+        user = {"phone":phone,"name":None,
+                "account_type":"free","credit_remaining":20,
+                "credit_reset":datetime.utcnow()+timedelta(days=1),
+                "last_prompt":None}
         ref.set(user)
         return user
     return doc.to_dict()
 
-def update_user(phone, **fields):
+def update_user(phone,**fields):
     db.collection("users").document(phone).update(fields)
     logger.info(f"Updated {phone}: {fields}")
 
-def build_prompt(user, history, message):
+def build_prompt(user,history,message):
     parts = [SYSTEM_PROMPT]
     if user.get("name"):
         parts.append(f'User name: "{user["name"].split()[0]}"')
@@ -139,125 +131,146 @@ def build_prompt(user, history, message):
     parts.append("JSON:")
     return "\n".join(parts)
 
-@app.route("/webhook", methods=["GET", "POST"])
+def download_media(media_id):
+    # fetch URL
+    meta = requests.get(
+        f"https://graph.facebook.com/v15.0/{media_id}?fields=url",
+        headers={"Authorization":f"Bearer {ACCESS_TOKEN}"}
+    ).json()
+    url = meta.get("url")
+    return requests.get(url).content if url else None
+
+@app.route("/webhook",methods=["GET","POST"])
 def webhook():
-    if request.method == "GET":
-        if (request.args.get("hub.mode") == "subscribe" and
-            request.args.get("hub.verify_token") == VERIFY_TOKEN):
-            return request.args.get("hub.challenge"), 200
-        return "Verification failed", 403
+    if request.method=="GET":
+        if (request.args.get("hub.mode")=="subscribe" and
+            request.args.get("hub.verify_token")==VERIFY_TOKEN):
+            return request.args.get("hub.challenge"),200
+        return "Verification failed",403
 
-    data  = request.json or {}
-    entry = data.get("entry", [])
+    data = request.json or {}
+    entry = data.get("entry",[])
     if not entry or not entry[0].get("changes"):
-        return "OK", 200
+        return "OK",200
 
-    msg   = entry[0]["changes"][0]["value"].get("messages", [{}])[0]
+    msg = entry[0]["changes"][0]["value"].get("messages",[{}])[0]
     phone = msg.get("from")
 
-    # Handle incoming images
-    if msg.get("type") == "image":
+    # Image handling
+    if msg.get("type")=="image":
         media_id = msg["image"]["id"]
-        # fetch media URL
-        meta = requests.get(
-            f"https://graph.facebook.com/v15.0/{media_id}",
-            headers={"Authorization": f"Bearer {ACCESS_TOKEN}"}
-        ).json()
-        media_url = meta.get("url")
-        # download the image
-        img_data = requests.get(media_url).content
-        img_path = f"/tmp/{media_id}.jpg"
-        with open(img_path, "wb") as f:
-            f.write(img_data)
-        # send to Gemini for description
-        analysis_prompt = (
-            SYSTEM_PROMPT + "\n" +
-            f'User name: "{get_or_create_user(phone)["name"].split()[0] if get_or_create_user(phone)["name"] else ""}"\n'
-            f'User sent an image: {media_url}\nJSON:'
-        )
-        raw = get_gemini(analysis_prompt)
+        img_data = download_media(media_id)
+        if img_data:
+            image = vision.Image(content=img_data)
+            resp = vision_client.document_text_detection(image=image)
+            extracted = resp.full_text_annotation.text or ""
+            prompt = SYSTEM_PROMPT + "\n" + \
+                     f'User name: "{get_or_create_user(phone)["name"].split()[0] if get_or_create_user(phone)["name"] else ""}"\n' + \
+                     f'Extracted text from image:\n{extracted}\nJSON:'
+            raw = get_gemini(prompt)
+            clean = strip_fences(raw)
+            try:
+                j = json.loads(clean); content = j.get("content","")
+            except:
+                content = clean
+            send_text(phone,content)
+            send_buttons(phone)
+        else:
+            send_text(phone,"Could not retrieve your image.")
+        return "OK",200
+
+    # Document handling (PDF)
+    if msg.get("type")=="document":
+        media_id = msg["document"]["id"]
+        filename = msg["document"].get("filename","file.pdf")
+        file_data = download_media(media_id)
+        text_extract = ""
+        if file_data:
+            path = f"/tmp/{filename}"
+            with open(path,"wb") as f: f.write(file_data)
+            if filename.lower().endswith(".pdf"):
+                reader = PyPDF2.PdfReader(path)
+                text_extract = "\n".join(p.extract_text() or "" for p in reader.pages)
+        prompt = SYSTEM_PROMPT + "\n" + \
+                 f'User name: "{get_or_create_user(phone)["name"].split()[0] if get_or_create_user(phone)["name"] else ""}"\n' + \
+                 f'Extracted text from document:\n{text_extract}\nJSON:'
+        raw = get_gemini(prompt)
         clean = strip_fences(raw)
         try:
-            resp = json.loads(clean)
-            content = resp.get("content", "")
+            j = json.loads(clean); content = j.get("content","")
         except:
             content = clean
-        send_text(phone, content)
+        send_text(phone,content)
         send_buttons(phone)
-        return "OK", 200
+        return "OK",200
 
-    text  = msg.get("text", {}).get("body", "").strip()
+    text = msg.get("text",{}).get("body","").strip()
     if not phone or not text:
-        return "OK", 200
+        return "OK",200
 
     user = get_or_create_user(phone)
     now  = datetime.utcnow()
 
     # Onboarding
     if user["name"] is None:
-        if len(text.split()) >= 2:
+        if len(text.split())>=2:
             first = text.split()[0]
-            update_user(phone, name=text)
-            send_text(phone, f"What would you like to study today, {first}?")
+            update_user(phone,name=text)
+            send_text(phone,f"What would you like to study today, {first}?")
         else:
-            send_text(phone, "Please share your full name (first and last).")
-        return "OK", 200
+            send_text(phone,"Please share your full name (first and last).")
+        return "OK",200
 
-    # Free user credits
-    if user["account_type"] == "free":
+    # Credits
+    if user["account_type"]=="free":
         rt = user["credit_reset"]
-        if hasattr(rt, "to_datetime"):
-            rt = rt.to_datetime()
-        if isinstance(rt, datetime) and rt.tzinfo:
-            rt = rt.replace(tzinfo=None)
-        if now >= rt:
-            update_user(phone, credit_remaining=20, credit_reset=now + timedelta(days=1))
-            user["credit_remaining"] = 20
-        if user["credit_remaining"] <= 0:
-            send_text(phone, "Free limit reached (20/day). Upgrade for unlimited usage.")
-            return "OK", 200
-        update_user(phone, credit_remaining=user["credit_remaining"] - 1)
+        if hasattr(rt,"to_datetime"): rt=rt.to_datetime()
+        if isinstance(rt,datetime) and rt.tzinfo: rt=rt.replace(tzinfo=None)
+        if now>=rt:
+            update_user(phone,credit_remaining=20,credit_reset=now+timedelta(days=1))
+            user["credit_remaining"]=20
+        if user["credit_remaining"]<=0:
+            send_text(phone,"Free limit reached (20/day). Upgrade for unlimited usage.")
+            return "OK",200
+        update_user(phone,credit_remaining=user["credit_remaining"]-1)
 
-    # Interactive buttons
-    if msg.get("type") == "interactive":
-        ir = msg.get("interactive", {})
-        if ir.get("type") == "button_reply":
+    # Interactive replies
+    if msg.get("type")=="interactive":
+        ir = msg.get("interactive",{})
+        if ir.get("type")=="button_reply":
             bid = ir["button_reply"]["id"]
-            if bid == "understood":
-                send_text(phone, "Great—what’s next?")
-            elif bid == "explain_more" and user.get("last_prompt"):
-                more = get_gemini(user["last_prompt"] + "\n\nPlease explain in more detail.")
-                send_text(phone, strip_fences(more))
+            if bid=="understood":
+                send_text(phone,"Great—what’s next?")
+            elif bid=="explain_more" and user.get("last_prompt"):
+                more = get_gemini(user["last_prompt"]+"\n\nPlease explain in more detail.")
+                send_text(phone,strip_fences(more))
                 send_buttons(phone)
-        return "OK", 200
+        return "OK",200
 
-    # Maintain history
+    # Text flow
     sess    = ensure_session(phone)
     history = list(sess["history"])
     sess["history"].append(text)
 
-    # Query Gemini
-    prompt = build_prompt(user, history, text)
+    prompt = build_prompt(user,history,text)
     raw    = get_gemini(prompt)
     clean  = strip_fences(raw)
 
     try:
-        resp = json.loads(clean)
-        rtype = resp.get("type")
-        content = resp.get("content", "")
+        j = json.loads(clean)
+        rtype = j.get("type"); content = j.get("content","")
     except:
-        rtype = "answer"
-        content = clean
+        rtype = "answer"; content = clean
 
-    if not isinstance(content, str):
+    if not isinstance(content,str):
         content = str(content)
 
-    send_text(phone, content)
-    if rtype == "answer":
+    send_text(phone,content)
+    if rtype=="answer":
         send_buttons(phone)
 
-    update_user(phone, last_prompt=prompt)
-    return "OK", 200
+    update_user(phone,last_prompt=prompt)
+    return "OK",200
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=PORT)
+if __name__=="__main__":
+    app.run(host="0.0.0.0",port=PORT)
