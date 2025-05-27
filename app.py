@@ -1,208 +1,152 @@
-#!/usr/bin/env python3
-"""
-StudyMate AI: WhatsApp tutor with Google Vision + Gemini image understanding.
-"""
-
-import os
-import re
-import json
+ import os
 import requests
-from datetime import datetime, timedelta
-from flask import Flask, request
-
-# === Firebase Admin SDK ===
+from flask import Flask, request, jsonify
 import firebase_admin
 from firebase_admin import credentials, firestore
+from google.cloud import vision
+from google.oauth2 import service_account
+import google.generativeai as genai
+from io import BytesIO
+import logging
 
-cred = credentials.Certificate(os.getenv(
-    "GOOGLE_APPLICATION_CREDENTIALS",
-    "/etc/secrets/studymate-ai-9197f-firebase-adminsdk-fbsvc-5a52d9ff48.json"
-))
-firebase_admin.initialize_app(cred, {"projectId": os.getenv("PROJECT_ID")})
+app = Flask(__name__)
+
+# --- Setup secrets and environment variables ---
+SECRET_JSON_PATH = "/etc/secrets/studymate-ai-9197f-firebase-adminsdk-fbsvc-5a52d9ff48.json"
+os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = SECRET_JSON_PATH
+
+# WhatsApp details - set these as environment variables on Render
+WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
+PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
+WHATSAPP_API_URL = f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages"
+WHATSAPP_MEDIA_URL = "https://graph.facebook.com/v19.0/"
+
+# Gemini API key
+GENAI_API_KEY = os.getenv("GENAI_API_KEY")
+
+# --- Initialize Firebase Admin ---
+cred = credentials.Certificate(SECRET_JSON_PATH)
+firebase_admin.initialize_app(cred)
 db = firestore.client()
 
-# === Google Vision Client ===
-from google.cloud import vision
-vision_client = vision.ImageAnnotatorClient()
+# --- Initialize Google Vision Client ---
+vision_creds = service_account.Credentials.from_service_account_file(SECRET_JSON_PATH)
+vision_client = vision.ImageAnnotatorClient(credentials=vision_creds)
 
-# === Flask & WhatsApp setup ===
-app = Flask(__name__)
-VERIFY_TOKEN      = os.getenv("VERIFY_TOKEN")
-WHATSAPP_TOKEN    = os.getenv("ACCESS_TOKEN")
-WHATSAPP_PHONE_ID = os.getenv("PHONE_NUMBER_ID")
+# --- Configure Gemini API ---
+genai.configure(api_key=GENAI_API_KEY)
 
-# === Gemini (GenAI) setup ===
-import google.generativeai as genai
-genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-model = genai.GenerativeModel("gemini-1.5-pro-002")
+# Setup basic logging
+logging.basicConfig(level=logging.INFO)
 
-def log(label, obj=None):
-    print(f"[DEBUG] {label}: {json.dumps(obj, ensure_ascii=False) if obj else ''}")
+# --- Helper Functions ---
 
-def send_whatsapp_message(phone: str, text: str):
-    url = f"https://graph.facebook.com/v19.0/{WHATSAPP_PHONE_ID}/messages"
-    headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
-    payload = {"messaging_product": "whatsapp", "to": phone, "type": "text", "text": {"body": text}}
-    log("→ WhatsApp API REQUEST", {"url":url, "payload":payload})
-    resp = requests.post(url, headers=headers, json=payload)
-    try: body = resp.json()
-    except: body = resp.text
-    log("← WhatsApp API RESPONSE", {"status":resp.status_code, "body":body})
-    return resp
-
-def send_interactive_buttons(phone: str):
-    url = f"https://graph.facebook.com/v19.0/{WHATSAPP_PHONE_ID}/messages"
-    headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
-    interactive = {
-        "type":"button",
-        "body":{"text":"Did that make sense to you?"},
-        "action":{"buttons":[
-            {"type":"reply","reply":{"id":"understood","title":"Understood"}},
-            {"type":"reply","reply":{"id":"explain_more","title":"Explain more"}}
-        ]}
+def send_whatsapp_message(to, message):
+    headers = {
+        "Authorization": f"Bearer {WHATSAPP_TOKEN}",
+        "Content-Type": "application/json"
     }
-    payload = {"messaging_product":"whatsapp","to":phone,"type":"interactive","interactive":interactive}
-    log("→ BUTTONS REQUEST", {"url":url, "payload":interactive})
-    resp = requests.post(url, headers=headers, json=payload)
-    log("← BUTTONS RESPONSE", {"status":resp.status_code, "body":resp.text})
-    return resp
+    data = {
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "text",
+        "text": {"body": message}
+    }
+    resp = requests.post(WHATSAPP_API_URL, headers=headers, json=data)
+    if resp.status_code != 200:
+        logging.error(f"WhatsApp send message failed: {resp.status_code} {resp.text}")
+    return resp.json()
 
-# === Firestore helpers ===
-def get_or_create_user(phone: str) -> dict:
-    doc = db.collection("users").document(phone).get()
-    if not doc.exists:
-        user = {
-            "phone":phone,
-            "name":None,
-            "date_joined":firestore.SERVER_TIMESTAMP,
-            "last_prompt":None,
-            "account_type":"free",
-            "credit_remaining":20,
-            "credit_reset":datetime.utcnow()+timedelta(days=1)
-        }
-        db.collection("users").document(phone).set(user)
-        return user
-    return doc.to_dict()
+def fetch_whatsapp_media(media_id):
+    # Get media download URL from WhatsApp API
+    headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}"}
+    media_info_resp = requests.get(f"{WHATSAPP_MEDIA_URL}{media_id}", headers=headers)
+    if media_info_resp.status_code != 200:
+        logging.error(f"Failed to get media URL: {media_info_resp.text}")
+        return None
+    media_info = media_info_resp.json()
+    media_url = media_info.get("url")
+    if not media_url:
+        logging.error("No media URL found in WhatsApp media info")
+        return None
+    # Download media content
+    media_resp = requests.get(media_url, headers=headers)
+    if media_resp.status_code != 200:
+        logging.error(f"Failed to download media content: {media_resp.text}")
+        return None
+    return media_resp.content
 
-def update_user(phone: str, **fields):
-    db.collection("users").document(phone).update(fields)
+def analyze_image(image_bytes):
+    try:
+        image = vision.Image(content=image_bytes)
+        response = vision_client.label_detection(image=image)
+        labels = response.label_annotations
+        descriptions = [label.description for label in labels]
+        return ", ".join(descriptions) if descriptions else "No labels detected."
+    except Exception as e:
+        logging.error(f"Google Vision API error: {e}")
+        return "Sorry, I couldn't analyze the image."
 
-# === Gemini helpers ===
-def strip_greeting(text: str) -> str:
-    return re.sub(r'^(hi|hello|hey)[^\n]*\n?', '', text, flags=re.IGNORECASE).strip()
+# --- Flask route for webhook ---
 
-def get_gemini_reply(prompt: str) -> str:
-    log("→ Gemini prompt", {"prompt":prompt})
-    resp = model.generate_content(prompt)
-    text = strip_greeting(resp.text.strip())
-    log("← Gemini reply", {"reply":text})
-    return text
-
-# === Webhook endpoint ===
-@app.route("/webhook", methods=["GET","POST"])
+@app.route("/webhook", methods=["POST"])
 def webhook():
-    if request.method=="GET":
-        if (request.args.get("hub.mode")=="subscribe" and
-            request.args.get("hub.verify_token")==VERIFY_TOKEN):
-            return request.args.get("hub.challenge"),200
-        return "Verification failed",403
+    data = request.get_json()
+    logging.debug(f"Incoming webhook data: {data}")
 
-    data = request.get_json(force=True)
-    log("← Incoming webhook", data)
+    entry = data.get("entry", [{}])[0]
+    changes = entry.get("changes", [{}])[0]
+    value = changes.get("value", {})
+    messages = value.get("messages", [])
 
-    entry = data["entry"][0]["changes"][0]["value"]
-    if "messages" not in entry:
-        return "OK",200
+    if not messages:
+        return jsonify({}), 200
 
-    msg = entry["messages"][0]
-    phone = msg["from"]
-    user = get_or_create_user(phone)
-    msg_type = msg.get("type")
+    message = messages[0]
+    from_number = message.get("from")
 
-    # --- IMAGE HANDLING ---
-    if msg_type=="image":
-        media_id = msg["image"]["id"]
-        # 1) Fetch media URL
-        meta = requests.get(
-            f"https://graph.facebook.com/v19.0/{media_id}",
-            params={"access_token":WHATSAPP_TOKEN}
-        ).json()
-        media_url = meta.get("url")
-        # 2) Download bytes
-        img_bytes = requests.get(media_url, headers={
-            "Authorization":f"Bearer {WHATSAPP_TOKEN}"
-        }).content
-        # 3) Google Vision label detection
-        image = vision.Image(content=img_bytes)
-        labels = vision_client.label_detection(image=image).label_annotations
-        top_labels = [l.description for l in labels[:5]]
-        vision_desc = "I see: " + ", ".join(top_labels)
-        log("← Vision labels", vision_desc)
-        # 4) Ask Gemini to elaborate
-        prompt = f"Here are labels from an image: {vision_desc}. Please describe the scene in detail."
-        answer = get_gemini_reply(prompt)
-        send_whatsapp_message(phone, answer)
-        send_interactive_buttons(phone)
-        return "OK",200
+    if not from_number:
+        return jsonify({}), 200
 
-    # --- TEXT HANDLING ---
-    text = msg.get("text",{}).get("body","").strip()
+    try:
+        if "text" in message:
+            user_text = message["text"]["body"]
 
-    # a) Welcome back
-    if user.get("name") and text.lower() in ("hi","hello","hey"):
-        first = user["name"].split()[0]
-        send_whatsapp_message(phone, f"Welcome back, {first}! 🎓 What would you like to study today?")
-        return "OK",200
+            # Gemini AI chat response (no academic restriction)
+            response = genai.chat.get_message(
+                model="models/chat-bison-001",
+                messages=[{"author": "user", "content": user_text}]
+            )
+            answer = response.text
 
-    # b) Onboard name
-    if not user.get("name"):
-        if len(text.split())>=2:
-            update_user(phone, name=text)
-            send_whatsapp_message(phone, f"Nice to meet you, {text}! 🎓 What topic shall we study?")
+            send_whatsapp_message(from_number, answer)
+
+        elif "image" in message:
+            media_id = message["image"]["id"]
+            image_bytes = fetch_whatsapp_media(media_id)
+
+            if image_bytes:
+                labels = analyze_image(image_bytes)
+                send_whatsapp_message(from_number, f"I see: {labels}")
+            else:
+                send_whatsapp_message(from_number, "Sorry, I could not fetch or analyze your image.")
+
         else:
-            send_whatsapp_message(phone, "Please share your full name (first and last). 📖")
-        return "OK",200
+            send_whatsapp_message(from_number, "Sorry, I can only process text and images.")
 
-    # c) Interactive buttons
-    if msg_type=="interactive":
-        ir=msg.get("interactive",{})
-        if ir.get("type")=="button_reply":
-            pid=ir["button_reply"]["id"]
-            if pid=="understood":
-                send_whatsapp_message(phone,"Great! 🎉 What's next on your study list?")
-                return "OK",200
-            if pid=="explain_more" and user.get("last_prompt"):
-                detail = get_gemini_reply(user["last_prompt"]+"\n\nPlease explain more.")
-                send_whatsapp_message(phone, detail)
-                send_interactive_buttons(phone)
-                return "OK",200
+        # Save message + metadata to Firestore for logging/analytics
+        doc_ref = db.collection("messages").document()
+        doc_ref.set({
+            "from": from_number,
+            "message": message,
+            "timestamp": firestore.SERVER_TIMESTAMP
+        })
 
-    # d) Credit reset for free users
-    if user.get("account_type")=="free":
-        rt=user.get("credit_reset")
-        if hasattr(rt,"to_datetime"):
-            rt=rt.to_datetime().replace(tzinfo=None)
-        if isinstance(rt,datetime) and datetime.utcnow()>=rt:
-            update_user(phone, credit_remaining=20, credit_reset=datetime.utcnow()+timedelta(days=1))
-            user["credit_remaining"]=20
-        if user.get("credit_remaining",0)<=0:
-            send_whatsapp_message(phone,"Free limit reached (20/day). Upgrade to Premium for unlimited prompts.")
-            return "OK",200
-        update_user(phone, credit_remaining=user["credit_remaining"]-1)
+    except Exception as e:
+        logging.error(f"Error handling message: {e}")
 
-    # e) Academic Q&A
-    prompt = (
-        f"You are StudyMate AI, an academic tutor by ByteWave Media. "
-        f"Answer the question below with clear, step-by-step academic explanations only. "
-        f"Do NOT include any summaries or conclusions. "
-        f"Question: {text}"
-    )
-    update_user(phone, last_prompt=prompt)
-    send_whatsapp_message(phone,"🤖 Thinking...")
-    answer = get_gemini_reply(prompt)
-    send_whatsapp_message(phone, answer)
-    send_interactive_buttons(phone)
-    return "OK",200
+    return jsonify({}), 200
 
-if __name__=="__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT",10000)))
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
