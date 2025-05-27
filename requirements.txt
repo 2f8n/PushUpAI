@@ -7,4 +7,6 @@ google-auth>=2.0.0
 google-auth-httplib2>=0.2.0
 google-cloud-vision>=3.10.1
 google-cloud-firestore>=2.20.2
+google-cloud-speech>=2.21.0
 PyPDF2>=3.0.1
+python-dotenv>=1.1.0
