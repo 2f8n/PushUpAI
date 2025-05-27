@@ -14,13 +14,13 @@ import google.generativeai as genai
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s — %(message)s")
 logger = logging.getLogger("StudyMate")
 
+# Load environment variables
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
     pass
 
-# Ensure required env vars
 for v in ("VERIFY_TOKEN", "ACCESS_TOKEN", "PHONE_NUMBER_ID", "GEMINI_API_KEY"):
     if not os.getenv(v):
         logger.error(f"Missing environment variable: {v}")
@@ -35,7 +35,7 @@ PORT            = int(os.getenv("PORT", 10000))
 genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel("gemini-1.5-pro-002")
 
-# Firestore setup
+# Firestore for user data
 KEY_FILE    = "studymate-ai-9197f-firebase-adminsdk-fbsvc-5a52d9ff48.json"
 SECRET_PATH = f"/etc/secrets/{KEY_FILE}"
 cred_path   = SECRET_PATH if os.path.exists(SECRET_PATH) else KEY_FILE
@@ -62,15 +62,17 @@ def safe_post(url, payload):
             headers={"Authorization": f"Bearer {ACCESS_TOKEN}", "Content-Type": "application/json"},
             json=payload
         )
-        if r.status_code != 200:
+        if r.status_code not in (200, 201):
             logger.error(f"WhatsApp API {r.status_code}: {r.text}")
     except Exception:
         logger.exception("Failed to send WhatsApp message")
 
 def send_text(phone, text):
+    # wrap in quotes with one-line margin top/bottom
+    wrapped = f"\n\"{text}\"\n"
     safe_post(
         f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages",
-        {"messaging_product": "whatsapp", "to": phone, "type": "text", "text": {"body": text}}
+        {"messaging_product": "whatsapp", "to": phone, "type": "text", "text": {"body": wrapped}}
     )
 
 def send_buttons(phone):
@@ -94,10 +96,10 @@ def send_buttons(phone):
     )
 
 def strip_fences(text):
-    text = text.strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```[\w]*|```$", "", text).strip()
-    return text
+    t = text.strip()
+    if t.startswith("```"):
+        t = re.sub(r"^```[\w]*|```$", "", t).strip()
+    return t
 
 def get_gemini(prompt):
     try:
@@ -152,6 +154,38 @@ def webhook():
 
     msg   = entry[0]["changes"][0]["value"].get("messages", [{}])[0]
     phone = msg.get("from")
+
+    # Handle incoming images
+    if msg.get("type") == "image":
+        media_id = msg["image"]["id"]
+        # fetch media URL
+        meta = requests.get(
+            f"https://graph.facebook.com/v15.0/{media_id}",
+            headers={"Authorization": f"Bearer {ACCESS_TOKEN}"}
+        ).json()
+        media_url = meta.get("url")
+        # download the image
+        img_data = requests.get(media_url).content
+        img_path = f"/tmp/{media_id}.jpg"
+        with open(img_path, "wb") as f:
+            f.write(img_data)
+        # send to Gemini for description
+        analysis_prompt = (
+            SYSTEM_PROMPT + "\n" +
+            f'User name: "{get_or_create_user(phone)["name"].split()[0] if get_or_create_user(phone)["name"] else ""}"\n'
+            f'User sent an image: {media_url}\nJSON:'
+        )
+        raw = get_gemini(analysis_prompt)
+        clean = strip_fences(raw)
+        try:
+            resp = json.loads(clean)
+            content = resp.get("content", "")
+        except:
+            content = clean
+        send_text(phone, content)
+        send_buttons(phone)
+        return "OK", 200
+
     text  = msg.get("text", {}).get("body", "").strip()
     if not phone or not text:
         return "OK", 200
@@ -169,7 +203,7 @@ def webhook():
             send_text(phone, "Please share your full name (first and last).")
         return "OK", 200
 
-    # Credits
+    # Free user credits
     if user["account_type"] == "free":
         rt = user["credit_reset"]
         if hasattr(rt, "to_datetime"):
@@ -184,7 +218,7 @@ def webhook():
             return "OK", 200
         update_user(phone, credit_remaining=user["credit_remaining"] - 1)
 
-    # Interactive replies
+    # Interactive buttons
     if msg.get("type") == "interactive":
         ir = msg.get("interactive", {})
         if ir.get("type") == "button_reply":
@@ -197,10 +231,12 @@ def webhook():
                 send_buttons(phone)
         return "OK", 200
 
+    # Maintain history
     sess    = ensure_session(phone)
     history = list(sess["history"])
     sess["history"].append(text)
 
+    # Query Gemini
     prompt = build_prompt(user, history, text)
     raw    = get_gemini(prompt)
     clean  = strip_fences(raw)
@@ -209,8 +245,7 @@ def webhook():
         resp = json.loads(clean)
         rtype = resp.get("type")
         content = resp.get("content", "")
-    except Exception:
-        logger.error(f"Failed to parse JSON: {clean}")
+    except:
         rtype = "answer"
         content = clean
 
