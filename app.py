@@ -3,12 +3,14 @@ import json
 import logging
 from collections import deque
 from datetime import datetime, timedelta
+import tempfile
 
 import requests
 from flask import Flask, request
 import firebase_admin
 from firebase_admin import credentials, firestore
 import google.generativeai as genai
+from google.cloud import speech
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s — %(message)s")
 logger = logging.getLogger("StudyMate")
@@ -20,7 +22,7 @@ try:
 except ImportError:
     pass
 
-# Required env variables
+# Environment variables
 for v in ("VERIFY_TOKEN", "ACCESS_TOKEN", "PHONE_NUMBER_ID", "GEMINI_API_KEY"):
     if not os.getenv(v):
         logger.error(f"Missing environment variable: {v}")
@@ -32,19 +34,20 @@ PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 PORT = int(os.getenv("PORT", 10000))
 
-# Path to Firebase service account json in Render secret files
-FIREBASE_SECRET_PATH = "/etc/secrets/studymate-ai-9197f-firebase-adminsdk-fbsvc-5a52d9ff48.json"
-
-# Initialize Firebase with secret file path
-cred = credentials.Certificate(FIREBASE_SECRET_PATH)
-firebase_admin.initialize_app(cred)
-db = firestore.client()
-
 # Initialize Gemini AI
 genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel("gemini-1.5-pro-002")
 
-# Load system prompt instructions
+# Initialize Firebase (using secret file mounted in /etc/secrets/)
+firebase_secret_path = "/etc/secrets/studymate-ai-9197f-firebase-adminsdk-fbsvc-5a52d9ff48.json"
+cred = credentials.Certificate(firebase_secret_path)
+firebase_admin.initialize_app(cred)
+db = firestore.client()
+
+# Initialize Google Speech client once (global)
+speech_client = speech.SpeechClient()
+
+# Load system prompt (AI instruction guide)
 with open("studymate_prompt.txt", "r") as f:
     SYSTEM_PROMPT = f.read().strip()
 
@@ -58,43 +61,46 @@ def ensure_session(phone):
 
 def safe_post(url, payload):
     try:
-        r = requests.post(url,
-                          headers={"Authorization": f"Bearer {ACCESS_TOKEN}",
-                                   "Content-Type": "application/json"},
-                          json=payload)
+        r = requests.post(
+            url,
+            headers={"Authorization": f"Bearer {ACCESS_TOKEN}", "Content-Type": "application/json"},
+            json=payload,
+        )
         if r.status_code not in (200, 201):
             logger.error(f"WhatsApp API {r.status_code}: {r.text}")
     except Exception:
         logger.exception("Failed WhatsApp send")
 
 def send_text(phone, text):
-    safe_post(f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages", {
-        "messaging_product": "whatsapp", "to": phone,
-        "type": "text", "text": {"body": text}
-    })
+    safe_post(
+        f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages",
+        {"messaging_product": "whatsapp", "to": phone, "type": "text", "text": {"body": text}},
+    )
 
 def send_buttons(phone):
-    safe_post(f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages", {
-        "messaging_product": "whatsapp", "to": phone,
-        "type": "interactive", "interactive": {
-            "type": "button", "body": {"text": "Did that make sense to you?"},
-            "action": {"buttons": [
-                {"type": "reply", "reply": {"id": "understood", "title": "Understood"}},
-                {"type": "reply", "reply": {"id": "explain_more", "title": "Explain more"}}
-            ]}
-        }
-    })
+    safe_post(
+        f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages",
+        {
+            "messaging_product": "whatsapp",
+            "to": phone,
+            "type": "interactive",
+            "interactive": {
+                "type": "button",
+                "body": {"text": "Did that make sense to you?"},
+                "action": {
+                    "buttons": [
+                        {"type": "reply", "reply": {"id": "understood", "title": "Understood"}},
+                        {"type": "reply", "reply": {"id": "explain_more", "title": "Explain more"}},
+                    ]
+                },
+            },
+        },
+    )
 
 def strip_fences(t):
     t = t.strip()
     if t.startswith("```"):
-        # Remove triple backticks and optional language hint
-        lines = t.splitlines()
-        if lines[0].startswith("```"):
-            lines = lines[1:]
-        if lines[-1].strip() == "```":
-            lines = lines[:-1]
-        return "\n".join(lines).strip()
+        t = t.strip("`").strip()
     return t
 
 def get_gemini(prompt):
@@ -114,7 +120,7 @@ def get_or_create_user(phone):
             "account_type": "free",
             "credit_remaining": 20,
             "credit_reset": datetime.utcnow() + timedelta(days=1),
-            "last_prompt": None
+            "last_prompt": None,
         }
         ref.set(user)
         return user
@@ -127,7 +133,6 @@ def update_user(phone, **fields):
 def build_prompt(user, history, message):
     parts = [SYSTEM_PROMPT]
     if user.get("name"):
-        # Use first name only
         parts.append(f'User name: "{user["name"].split()[0]}"')
     if history:
         parts.append("Recent messages:")
@@ -136,11 +141,40 @@ def build_prompt(user, history, message):
     parts.append("JSON:")
     return "\n".join(parts)
 
+def transcribe_audio_from_url(media_url):
+    try:
+        response = requests.get(media_url)
+        response.raise_for_status()
+        audio_content = response.content
+    except Exception as e:
+        logger.error(f"Failed to download media: {e}")
+        return None
+
+    # Recognize audio content with Google Speech-to-Text
+    audio = speech.RecognitionAudio(content=audio_content)
+    config = speech.RecognitionConfig(
+        encoding=speech.RecognitionConfig.AudioEncoding.OGG_OPUS,
+        sample_rate_hertz=16000,
+        language_code="en-US",
+        audio_channel_count=1,
+    )
+
+    try:
+        response = speech_client.recognize(config=config, audio=audio)
+        if response.results:
+            transcript = response.results[0].alternatives[0].transcript
+            logger.info(f"Transcribed audio: {transcript}")
+            return transcript
+        else:
+            return None
+    except Exception as e:
+        logger.error(f"Speech recognition error: {e}")
+        return None
+
 @app.route("/webhook", methods=["GET", "POST"])
 def webhook():
     if request.method == "GET":
-        if (request.args.get("hub.mode") == "subscribe" and
-            request.args.get("hub.verify_token") == VERIFY_TOKEN):
+        if request.args.get("hub.mode") == "subscribe" and request.args.get("hub.verify_token") == VERIFY_TOKEN:
             return request.args.get("hub.challenge"), 200
         return "Verification failed", 403
 
@@ -151,13 +185,39 @@ def webhook():
 
     msg = entry[0]["changes"][0]["value"].get("messages", [{}])[0]
     phone = msg.get("from")
-
     if not phone:
         return "OK", 200
 
-    # Only handle text messages here
-    text = msg.get("text", {}).get("body", "").strip()
-    if not text:
+    # Detect message type: text or audio
+    msg_type = msg.get("type")
+    text = ""
+    if msg_type == "text":
+        text = msg.get("text", {}).get("body", "").strip()
+    elif msg_type in ("audio", "voice"):
+        media_id = msg.get(msg_type, {}).get("id")
+        if not media_id:
+            send_text(phone, "Sorry, I couldn't find the audio to process.")
+            return "OK", 200
+
+        # Get media URL
+        media_url_resp = requests.get(
+            f"https://graph.facebook.com/v19.0/{media_id}",
+            headers={"Authorization": f"Bearer {ACCESS_TOKEN}"},
+        )
+        media_url = media_url_resp.json().get("url")
+        if not media_url:
+            send_text(phone, "Sorry, I couldn't retrieve your audio. Please try again.")
+            return "OK", 200
+
+        transcript = transcribe_audio_from_url(media_url)
+        if not transcript:
+            send_text(phone, "Sorry, I couldn't understand the audio. Please try again.")
+            return "OK", 200
+
+        text = transcript
+        logger.info(f"User {phone} audio transcribed to: {text}")
+    else:
+        # Ignore unsupported message types for now
         return "OK", 200
 
     user = get_or_create_user(phone)
@@ -189,7 +249,7 @@ def webhook():
         update_user(phone, credit_remaining=user["credit_remaining"] - 1)
 
     # Interactive replies (buttons)
-    if msg.get("type") == "interactive":
+    if msg_type == "interactive":
         ir = msg.get("interactive", {})
         if ir.get("type") == "button_reply":
             bid = ir["button_reply"]["id"]
@@ -201,7 +261,7 @@ def webhook():
                 send_buttons(phone)
         return "OK", 200
 
-    # Normal text flow
+    # Normal text or transcribed audio flow
     sess = ensure_session(phone)
     history = list(sess["history"])
     sess["history"].append(text)
@@ -218,19 +278,19 @@ def webhook():
         rtype = "answer"
         content = clean
 
-    # Clean content type issues
     if not isinstance(content, str):
         content = str(content)
 
-    # Send only the content, not the JSON structure
     send_text(phone, content)
 
-    # Send buttons ONLY if this is an academic answer (type=="answer")
+    # Send buttons ONLY if AI answered academically (rtype=="answer")
     if rtype == "answer":
         send_buttons(phone)
 
     update_user(phone, last_prompt=prompt)
+
     return "OK", 200
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=PORT)
