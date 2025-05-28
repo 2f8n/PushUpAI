@@ -100,29 +100,24 @@ def send_buttons(phone):
         },
     )
 
-def strip_fences_and_tags(t):
-    t = t.strip()
-    # Remove fenced code blocks markers
+def strip_fences_and_tags(text):
+    # Remove code fences
+    t = text.strip()
     if t.startswith("```"):
-        lines = t.splitlines()
-        if lines[0].startswith("```"):
-            lines = lines[1:]
-        if lines and lines[-1].startswith("```"):
-            lines = lines[:-1]
-        t = "\n".join(lines).strip()
-    # Remove standalone 'json' line at start
+        parts = t.split("```")
+        if len(parts) >= 3:
+            t = parts[1]
+    # Remove leading 'json' line
     lines = t.splitlines()
     if lines and lines[0].strip().lower() == "json":
         lines = lines[1:]
-        t = "\n".join(lines).strip()
-    return t
+    return "\n".join(lines).strip()
 
 def get_gemini(prompt):
     try:
-        return model.generate_content(prompt).text.strip()
+        return model.generate_content(prompt).text
     except Exception:
         logger.exception("Gemini API error")
-        # Return a valid JSON fallback
         return json.dumps({"type": "clarification", "content": "Sorry, I encountered an error. Please try again."})
 
 def get_or_create_user(phone):
@@ -184,7 +179,7 @@ def transcribe_audio_with_speech(audio_bytes):
             audio_channel_count=1,
         )
         response = speech_client.recognize(config=config, audio=audio)
-        transcript = "".join(result.alternatives[0].transcript for result in response.results)
+        transcript = "".join(r.alternatives[0].transcript for r in response.results)
         return transcript.strip()
     except Exception as e:
         logger.error(f"Speech recognition error: {e}")
@@ -226,10 +221,8 @@ def webhook():
     # Credit reset & decrement
     if user["account_type"] == "free":
         rt = user["credit_reset"]
-        if hasattr(rt, "to_datetime"):
-            rt = rt.to_datetime()
-        if isinstance(rt, datetime) and rt.tzinfo:
-            rt = rt.replace(tzinfo=None)
+        if hasattr(rt, "to_datetime"): rt = rt.to_datetime()
+        if isinstance(rt, datetime) and rt.tzinfo: rt = rt.replace(tzinfo=None)
         if now >= rt:
             update_user(phone, credit_remaining=20, credit_reset=now + timedelta(days=1))
             user["credit_remaining"] = 20
@@ -247,4 +240,62 @@ def webhook():
                 send_text(phone, "Great—what’s next?")
             elif bid == "explain_more" and user.get("last_prompt"):
                 more = get_gemini(user["last_prompt"] + "\n\nPlease explain in more detail.")
-                clean_more = strip_fences_and_tags(more)
+                raw = strip_fences_and_tags(more)
+                send_text(phone, raw)
+                send_buttons(phone)
+        return "OK", 200
+
+    # Handle incoming content
+    text = msg.get("text", {}).get("body")
+    if text:
+        gemini_input = text.strip()
+    elif "image" in msg:
+        try:
+            media_url = get_whatsapp_media_url(msg["image"]["id"])
+            img_bytes = download_media(media_url)
+            extracted = analyze_image_with_vision(img_bytes)
+            gemini_input = extracted or "I received an image but couldn't extract text. Please describe it."
+        except Exception:
+            gemini_input = "Sorry, I couldn't process the image."
+    elif "audio" in msg:
+        try:
+            media_url = get_whatsapp_media_url(msg["audio"]["id"])
+            aud_bytes = download_media(media_url)
+            transcript = transcribe_audio_with_speech(aud_bytes)
+            gemini_input = transcript or "Sorry, I couldn't understand the audio. Please try again."
+        except Exception:
+            gemini_input = "Sorry, I couldn't process the audio."
+    else:
+        return "OK", 200
+
+    sess["history"].append(gemini_input)
+    user_first = user["name"].split()[0] if user.get("name") else None
+    prompt = build_prompt(user, history, gemini_input, user_first)
+
+    raw_resp = get_gemini(prompt)
+    cleaned = strip_fences_and_tags(raw_resp)
+
+    # Attempt JSON parse
+    try:
+        obj = json.loads(cleaned)
+        rtype = obj.get("type", "answer")
+        content = obj.get("content", "")
+    except Exception:
+        rtype, content = "answer", cleaned
+
+    # Fix escaped/newline markers
+    if isinstance(content, str):
+        content = content.replace("\\n", "\n").replace("/n/", "\n")
+
+    send_text(phone, content)
+
+    # Send buttons if academic answer
+    keywords = ["step-by-step", "essay", "project", "exam", "solution", "problem", "question"]
+    if rtype == "answer" and any(k in content.lower() for k in keywords):
+        send_buttons(phone)
+
+    update_user(phone, last_prompt=prompt)
+    return "OK", 200
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=PORT)
