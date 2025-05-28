@@ -101,13 +101,13 @@ def send_buttons(phone):
     )
 
 def strip_fences_and_tags(text):
-    # Remove code fences
     t = text.strip()
+    # remove triple-backtick fences
     if t.startswith("```"):
         parts = t.split("```")
         if len(parts) >= 3:
             t = parts[1]
-    # Remove leading 'json' line
+    # drop leading 'json' line
     lines = t.splitlines()
     if lines and lines[0].strip().lower() == "json":
         lines = lines[1:]
@@ -174,12 +174,13 @@ def transcribe_audio_with_speech(audio_bytes):
     try:
         audio = speech.RecognitionAudio(content=audio_bytes)
         config = speech.RecognitionConfig(
-            encoding=speech.RecognitionConfig.AudioEncoding.ENCODING_UNSPECIFIED,
+            encoding=speech.RecognitionConfig.AudioEncoding.OGG_OPUS,
             language_code="en-US",
             audio_channel_count=1,
+            enable_automatic_punctuation=True
         )
         response = speech_client.recognize(config=config, audio=audio)
-        transcript = "".join(r.alternatives[0].transcript for r in response.results)
+        transcript = "".join(res.alternatives[0].transcript for res in response.results)
         return transcript.strip()
     except Exception as e:
         logger.error(f"Speech recognition error: {e}")
@@ -207,18 +208,18 @@ def webhook():
     history = list(sess["history"])
     now = datetime.utcnow()
 
-    # Onboarding
+    # Onboarding: collect full name
     if user["name"] is None:
-        text = msg.get("text", {}).get("body", "").strip()
-        if text and len(text.split()) >= 2:
-            first_name = text.split()[0]
-            update_user(phone, name=text)
+        text_body = msg.get("text", {}).get("body", "").strip()
+        if text_body and len(text_body.split()) >= 2:
+            first_name = text_body.split()[0]
+            update_user(phone, name=text_body)
             send_text(phone, f"What would you like to study today, {first_name}?")
         else:
             send_text(phone, "Please share your full name (first and last).")
         return "OK", 200
 
-    # Credit reset & decrement
+    # Handle free-account credits
     if user["account_type"] == "free":
         rt = user["credit_reset"]
         if hasattr(rt, "to_datetime"): rt = rt.to_datetime()
@@ -231,7 +232,7 @@ def webhook():
             return "OK", 200
         update_user(phone, credit_remaining=user["credit_remaining"] - 1)
 
-    # Interactive buttons reply
+    # Interactive button replies
     if msg.get("type") == "interactive":
         ir = msg.get("interactive", {})
         if ir.get("type") == "button_reply":
@@ -245,53 +246,59 @@ def webhook():
                 send_buttons(phone)
         return "OK", 200
 
-    # Handle incoming content
-    text = msg.get("text", {}).get("body")
-    if text:
-        gemini_input = text.strip()
-    elif "image" in msg:
+    # Determine content type
+    gemini_input = None
+    if msg.get("text"):
+        gemini_input = msg["text"]["body"].strip()
+    elif msg.get("image"):
         try:
-            media_url = get_whatsapp_media_url(msg["image"]["id"])
-            img_bytes = download_media(media_url)
-            extracted = analyze_image_with_vision(img_bytes)
-            gemini_input = extracted or "I received an image but couldn't extract text. Please describe it."
-        except Exception:
-            gemini_input = "Sorry, I couldn't process the image."
-    elif "audio" in msg:
+            url = get_whatsapp_media_url(msg["image"]["id"])
+            img_bytes = download_media(url)
+            text_extracted = analyze_image_with_vision(img_bytes)
+            gemini_input = text_extracted or "I received an image but couldn't extract readable text. Please describe it."
+        except Exception as e:
+            logger.error(f"Image processing error: {e}")
+            gemini_input = "Sorry, I had trouble processing your image. Please try again."
+    elif msg.get("audio"):
         try:
-            media_url = get_whatsapp_media_url(msg["audio"]["id"])
-            aud_bytes = download_media(media_url)
-            transcript = transcribe_audio_with_speech(aud_bytes)
+            url = get_whatsapp_media_url(msg["audio"]["id"])
+            audio_bytes = download_media(url)
+            transcript = transcribe_audio_with_speech(audio_bytes)
             gemini_input = transcript or "Sorry, I couldn't understand the audio. Please try again."
-        except Exception:
-            gemini_input = "Sorry, I couldn't process the audio."
+        except Exception as e:
+            logger.error(f"Audio processing error: {e}")
+            gemini_input = "Sorry, I had trouble processing your audio. Please try again."
     else:
         return "OK", 200
 
+    # Append to session history
     sess["history"].append(gemini_input)
-    user_first = user["name"].split()[0] if user.get("name") else None
-    prompt = build_prompt(user, history, gemini_input, user_first)
+    user_first_name = user["name"].split()[0] if user.get("name") else None
+    prompt = build_prompt(user, history, gemini_input, user_first_name)
 
-    raw_resp = get_gemini(prompt)
-    cleaned = strip_fences_and_tags(raw_resp)
+    # Call Gemini
+    raw = get_gemini(prompt)
+    logger.info(f"Gemini raw response:\n{raw}")
+    clean = strip_fences_and_tags(raw)
 
-    # Attempt JSON parse
+    # Parse JSON
     try:
-        obj = json.loads(cleaned)
-        rtype = obj.get("type", "answer")
-        content = obj.get("content", "")
+        parsed = json.loads(clean)
+        rtype = parsed.get("type", "answer")
+        content = parsed.get("content", "")
     except Exception:
-        rtype, content = "answer", cleaned
+        rtype = "answer"
+        content = clean
 
-    # Fix escaped/newline markers
+    # Normalize newlines
     if isinstance(content, str):
         content = content.replace("\\n", "\n").replace("/n/", "\n")
 
     send_text(phone, content)
 
-    # Send buttons if academic answer
-    keywords = ["step-by-step", "essay", "project", "exam", "solution", "problem", "question"]
-    if rtype == "answer" and any(k in content.lower() for k in keywords):
+    # Add buttons after academic answers
+    academic_keywords = ["step-by-step", "essay", "project", "exam", "solution", "problem", "question"]
+    if rtype == "answer" and any(k in content.lower() for k in academic_keywords):
         send_buttons(phone)
 
     update_user(phone, last_prompt=prompt)
