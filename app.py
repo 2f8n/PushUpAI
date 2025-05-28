@@ -16,25 +16,16 @@ from google.cloud import speech_v1p1beta1 as speech
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s — %(message)s")
 logger = logging.getLogger("StudyMate")
 
-# Load .env if present
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass
-
-# Env vars check
-required_envs = ["VERIFY_TOKEN", "ACCESS_TOKEN", "PHONE_NUMBER_ID", "GEMINI_API_KEY"]
-for v in required_envs:
-    if not os.getenv(v):
-        logger.error(f"Missing environment variable: {v}")
-        raise SystemExit(f"Please set environment variable: {v}")
-
+# Load environment variables
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
 ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 PORT = int(os.getenv("PORT", 10000))
+
+if not all([VERIFY_TOKEN, ACCESS_TOKEN, PHONE_NUMBER_ID, GEMINI_API_KEY]):
+    logger.error("Missing required environment variables")
+    raise SystemExit("Missing required environment variables")
 
 # Initialize Gemini AI
 genai.configure(api_key=GEMINI_API_KEY)
@@ -45,13 +36,13 @@ cred = credentials.Certificate("/etc/secrets/studymate-ai-9197f-firebase-adminsd
 firebase_admin.initialize_app(cred)
 db = firestore.client()
 
-# Initialize Google Vision client (assumes GOOGLE_APPLICATION_CREDENTIALS env set to secret)
+# Initialize Google Vision client
 vision_client = vision.ImageAnnotatorClient()
 
 # Initialize Google Speech client
 speech_client = speech.SpeechClient()
 
-# Load system prompt
+# Load system prompt from file
 with open("studymate_prompt.txt", "r") as f:
     SYSTEM_PROMPT = f.read().strip()
 
@@ -60,7 +51,7 @@ sessions = {}  # phone -> {"history": deque(maxlen=5)}
 
 def ensure_session(phone):
     if phone not in sessions:
-        sessions[phone] = {"history": deque(maxlen=5), "topic": None}
+        sessions[phone] = {"history": deque(maxlen=5)}
     return sessions[phone]
 
 def safe_post(url, payload):
@@ -71,14 +62,14 @@ def safe_post(url, payload):
             json=payload,
         )
         if r.status_code not in (200, 201):
-            logger.error(f"WhatsApp API {r.status_code}: {r.text}")
+            logger.error(f"WhatsApp API error {r.status_code}: {r.text}")
         return r
     except Exception:
         logger.exception("Failed WhatsApp send")
         return None
 
 def send_text(phone, text):
-    safe_post(
+    return safe_post(
         f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages",
         {
             "messaging_product": "whatsapp",
@@ -89,7 +80,7 @@ def send_text(phone, text):
     )
 
 def send_buttons(phone):
-    safe_post(
+    return safe_post(
         f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages",
         {
             "messaging_product": "whatsapp",
@@ -110,7 +101,6 @@ def send_buttons(phone):
 
 def strip_fences(t):
     t = t.strip()
-    # Remove ```json or ``` fences
     if t.startswith("```"):
         t = t.strip("`").strip()
     return t
@@ -119,7 +109,7 @@ def get_gemini(prompt):
     try:
         return model.generate_content(prompt).text.strip()
     except Exception:
-        logger.exception("Gemini error")
+        logger.exception("Gemini API error")
         return json.dumps({"type": "clarification", "content": "Sorry, I encountered an error. Please try again."})
 
 def get_or_create_user(phone):
@@ -158,11 +148,11 @@ def get_whatsapp_media_url(media_id):
     headers = {"Authorization": f"Bearer {ACCESS_TOKEN}"}
     r = requests.get(url, headers=headers)
     r.raise_for_status()
-    media_url = r.json().get("url")
-    return media_url
+    return r.json().get("url")
 
 def download_media(url):
-    r = requests.get(url)
+    headers = {"Authorization": f"Bearer {ACCESS_TOKEN}"}
+    r = requests.get(url, headers=headers)
     r.raise_for_status()
     return r.content
 
@@ -174,7 +164,7 @@ def analyze_image_with_vision(image_bytes):
         return texts[0].description.strip()
     return ""
 
-def transcribe_audio_with_speech(audio_bytes, audio_mime):
+def transcribe_audio_with_speech(audio_bytes):
     try:
         audio = speech.RecognitionAudio(content=audio_bytes)
         config = speech.RecognitionConfig(
@@ -194,7 +184,6 @@ def transcribe_audio_with_speech(audio_bytes, audio_mime):
 @app.route("/webhook", methods=["GET", "POST"])
 def webhook():
     if request.method == "GET":
-        # Verification challenge for webhook setup
         if request.args.get("hub.mode") == "subscribe" and request.args.get("hub.verify_token") == VERIFY_TOKEN:
             return request.args.get("hub.challenge"), 200
         return "Verification failed", 403
@@ -214,7 +203,7 @@ def webhook():
     history = list(sess["history"])
     now = datetime.utcnow()
 
-    # Handle user name onboarding
+    # Onboarding
     if user["name"] is None:
         text = msg.get("text", {}).get("body", "").strip()
         if text and len(text.split()) >= 2:
@@ -225,7 +214,7 @@ def webhook():
             send_text(phone, "Please share your full name (first and last).")
         return "OK", 200
 
-    # Reset credits daily
+    # Credit reset & decrement
     if user["account_type"] == "free":
         rt = user["credit_reset"]
         if hasattr(rt, "to_datetime"):
@@ -240,7 +229,7 @@ def webhook():
             return "OK", 200
         update_user(phone, credit_remaining=user["credit_remaining"] - 1)
 
-    # Handle interactive buttons replies
+    # Interactive buttons reply
     if msg.get("type") == "interactive":
         ir = msg.get("interactive", {})
         if ir.get("type") == "button_reply":
@@ -254,9 +243,9 @@ def webhook():
                 send_buttons(phone)
         return "OK", 200
 
-    # Handle text, image, and audio messages
-    text = msg.get("text", {}).get("body", "").strip()
+    # Handle message content
     gemini_input = ""
+    text = msg.get("text", {}).get("body", "").strip()
 
     if text:
         gemini_input = text
@@ -277,11 +266,10 @@ def webhook():
 
     elif "audio" in msg:
         media_id = msg["audio"]["id"]
-        mime_type = msg["audio"].get("mime_type", "audio/ogg")
         try:
             media_url = get_whatsapp_media_url(media_id)
             audio_bytes = download_media(media_url)
-            transcript = transcribe_audio_with_speech(audio_bytes, mime_type)
+            transcript = transcribe_audio_with_speech(audio_bytes)
             if transcript:
                 gemini_input = transcript
             else:
@@ -291,13 +279,12 @@ def webhook():
             gemini_input = "Sorry, I had trouble processing your audio. Please try again."
 
     else:
-        # Ignore unsupported message types
+        # Unsupported type
         return "OK", 200
 
-    # Add message to history
+    # Append to history
     sess["history"].append(gemini_input)
 
-    # Build Gemini prompt
     user_first_name = user["name"].split()[0] if user["name"] else None
     prompt = build_prompt(user, history, gemini_input, user_first_name)
 
@@ -305,29 +292,23 @@ def webhook():
     logger.info(f"Gemini raw response:\n{raw_response}")
     clean_response = strip_fences(raw_response)
 
-    # Try to parse JSON from Gemini
     try:
         response_json = json.loads(clean_response)
         rtype = response_json.get("type", "answer")
         content = response_json.get("content", "")
     except Exception:
-        # Fallback plain text
         rtype = "answer"
         content = clean_response
 
     if not isinstance(content, str):
         content = str(content)
 
-    # Send text reply
     send_text(phone, content)
 
-    # Send buttons ONLY for academic answers (type == "answer")
-    # Assuming academic answers contain the phrase "step-by-step" or "essay" or similar from content or type
     academic_keywords = ["step-by-step", "essay", "project", "exam", "solution", "problem", "question"]
     if rtype == "answer" and any(k in content.lower() for k in academic_keywords):
         send_buttons(phone)
 
-    # Save last prompt
     update_user(phone, last_prompt=prompt)
     return "OK", 200
 
