@@ -1,6 +1,7 @@
 import os
 import json
 import logging
+import re
 from collections import deque
 from datetime import datetime, timedelta
 
@@ -99,10 +100,21 @@ def send_buttons(phone):
         },
     )
 
-def strip_fences(t):
+def strip_fences_and_tags(t):
     t = t.strip()
+    # Remove fenced code blocks markers
     if t.startswith("```"):
-        t = t.strip("`").strip()
+        lines = t.splitlines()
+        if lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].startswith("```"):
+            lines = lines[:-1]
+        t = "\n".join(lines).strip()
+    # Remove standalone 'json' line at start
+    lines = t.splitlines()
+    if lines and lines[0].strip().lower() == "json":
+        lines = lines[1:]
+        t = "\n".join(lines).strip()
     return t
 
 def get_gemini(prompt):
@@ -110,6 +122,7 @@ def get_gemini(prompt):
         return model.generate_content(prompt).text.strip()
     except Exception:
         logger.exception("Gemini API error")
+        # Return a valid JSON fallback
         return json.dumps({"type": "clarification", "content": "Sorry, I encountered an error. Please try again."})
 
 def get_or_create_user(phone):
@@ -160,9 +173,7 @@ def analyze_image_with_vision(image_bytes):
     image = vision.Image(content=image_bytes)
     response = vision_client.text_detection(image=image)
     texts = response.text_annotations
-    if texts:
-        return texts[0].description.strip()
-    return ""
+    return texts[0].description.strip() if texts else ""
 
 def transcribe_audio_with_speech(audio_bytes):
     try:
@@ -173,9 +184,7 @@ def transcribe_audio_with_speech(audio_bytes):
             audio_channel_count=1,
         )
         response = speech_client.recognize(config=config, audio=audio)
-        transcript = ""
-        for result in response.results:
-            transcript += result.alternatives[0].transcript
+        transcript = "".join(result.alternatives[0].transcript for result in response.results)
         return transcript.strip()
     except Exception as e:
         logger.error(f"Speech recognition error: {e}")
@@ -238,80 +247,4 @@ def webhook():
                 send_text(phone, "Great—what’s next?")
             elif bid == "explain_more" and user.get("last_prompt"):
                 more = get_gemini(user["last_prompt"] + "\n\nPlease explain in more detail.")
-                clean_more = strip_fences(more)
-                send_text(phone, clean_more)
-                send_buttons(phone)
-        return "OK", 200
-
-    # Handle message content
-    gemini_input = ""
-    text = msg.get("text", {}).get("body", "").strip()
-
-    if text:
-        gemini_input = text
-
-    elif "image" in msg:
-        media_id = msg["image"]["id"]
-        try:
-            media_url = get_whatsapp_media_url(media_id)
-            image_bytes = download_media(media_url)
-            extracted_text = analyze_image_with_vision(image_bytes)
-            if extracted_text:
-                gemini_input = f"I received this text from an image you sent:\n{extracted_text}"
-            else:
-                gemini_input = "I received an image but couldn't extract readable text. Please describe it."
-        except Exception as e:
-            logger.error(f"Image processing error: {e}")
-            gemini_input = "Sorry, I had trouble processing your image. Please try again."
-
-    elif "audio" in msg:
-        media_id = msg["audio"]["id"]
-        try:
-            media_url = get_whatsapp_media_url(media_id)
-            audio_bytes = download_media(media_url)
-            transcript = transcribe_audio_with_speech(audio_bytes)
-            if transcript:
-                gemini_input = transcript
-            else:
-                gemini_input = "Sorry, I couldn't understand the audio. Please try again."
-        except Exception as e:
-            logger.error(f"Audio processing error: {e}")
-            gemini_input = "Sorry, I had trouble processing your audio. Please try again."
-
-    else:
-        # Unsupported type
-        return "OK", 200
-
-    # Append to history
-    sess["history"].append(gemini_input)
-
-    user_first_name = user["name"].split()[0] if user["name"] else None
-    prompt = build_prompt(user, history, gemini_input, user_first_name)
-
-    raw_response = get_gemini(prompt)
-    logger.info(f"Gemini raw response:\n{raw_response}")
-    clean_response = strip_fences(raw_response)
-
-    try:
-        response_json = json.loads(clean_response)
-        rtype = response_json.get("type", "answer")
-        content = response_json.get("content", "")
-    except Exception:
-        rtype = "answer"
-        content = clean_response
-
-    if not isinstance(content, str):
-        content = str(content)
-
-    send_text(phone, content)
-
-    academic_keywords = ["step-by-step", "essay", "project", "exam", "solution", "problem", "question"]
-    if rtype == "answer" and any(k in content.lower() for k in academic_keywords):
-        send_buttons(phone)
-
-    update_user(phone, last_prompt=prompt)
-    return "OK", 200
-
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=PORT)
+                clean_more = strip_fences_and_tags(more)
