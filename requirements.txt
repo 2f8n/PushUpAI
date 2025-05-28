@@ -10,3 +10,6 @@ google-cloud-firestore>=2.20.2
 google-cloud-speech>=2.21.0
 PyPDF2>=3.0.1
 python-dotenv>=1.1.0
+pydub>=0.25.1
+numpy>=1.23.0
+
