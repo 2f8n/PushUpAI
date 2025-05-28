@@ -101,8 +101,8 @@ def send_buttons(phone):
 
 def strip_fences(t):
     t = t.strip()
-    if t.startswith("```") and t.endswith("```"):
-        t = t[3:-3].strip()
+    if t.startswith("```"):
+        t = t.strip("`").strip()
     return t
 
 def get_gemini(prompt):
@@ -257,8 +257,6 @@ def webhook():
             image_bytes = download_media(media_url)
             extracted_text = analyze_image_with_vision(image_bytes)
             if extracted_text:
-                # Clean up newlines/spaces for prompt
-                extracted_text = "\n".join(line.strip() for line in extracted_text.splitlines() if line.strip())
                 gemini_input = f"I received this text from an image you sent:\n{extracted_text}"
             else:
                 gemini_input = "I received an image but couldn't extract readable text. Please describe it."
@@ -287,18 +285,11 @@ def webhook():
     # Append to history
     sess["history"].append(gemini_input)
 
-    def clean_text(t):
-        # Remove empty lines and strip spaces, unify newlines
-        return '\n'.join(line.strip() for line in t.splitlines() if line.strip())
-
-    gemini_input_clean = clean_text(gemini_input)
-
     user_first_name = user["name"].split()[0] if user["name"] else None
-    prompt = build_prompt(user, history, gemini_input_clean, user_first_name)
+    prompt = build_prompt(user, history, gemini_input, user_first_name)
 
     raw_response = get_gemini(prompt)
     logger.info(f"Gemini raw response:\n{raw_response}")
-
     clean_response = strip_fences(raw_response)
 
     try:
@@ -309,7 +300,8 @@ def webhook():
         rtype = "answer"
         content = clean_response
 
-    content = clean_text(content)
+    if not isinstance(content, str):
+        content = str(content)
 
     send_text(phone, content)
 
