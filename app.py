@@ -101,23 +101,15 @@ def send_buttons(phone):
 
 def strip_fences(t):
     t = t.strip()
-    if t.startswith("```"):
-        t = t.strip("`").strip()
+    if t.startswith("```") and t.endswith("```"):
+        t = t[3:-3].strip()
     return t
 
 def get_gemini(prompt):
     try:
-        # Correct method to generate content from Gemini per latest API:
-        response = model.generate(
-            prompt=prompt,
-            temperature=0.2,
-            max_output_tokens=1024
-        )
-        # Get the first candidate output text:
-        return response.candidates[0].output.strip()
+        return model.generate_content(prompt).text.strip()
     except Exception:
         logger.exception("Gemini API error")
-        # Return JSON string as fallback
         return json.dumps({"type": "clarification", "content": "Sorry, I encountered an error. Please try again."})
 
 def get_or_create_user(phone):
@@ -148,7 +140,7 @@ def build_prompt(user, history, message, user_first_name):
         parts.append("Recent messages:")
         parts.extend(f"- {h}" for h in history)
     parts.append(f'Current message: "{message}"')
-    parts.append("Output only JSON with type and content fields, formatted for WhatsApp text.")
+    parts.append("JSON:")
     return "\n".join(parts)
 
 def get_whatsapp_media_url(media_id):
@@ -156,8 +148,7 @@ def get_whatsapp_media_url(media_id):
     headers = {"Authorization": f"Bearer {ACCESS_TOKEN}"}
     r = requests.get(url, headers=headers)
     r.raise_for_status()
-    data = r.json()
-    return data.get("url")
+    return r.json().get("url")
 
 def download_media(url):
     headers = {"Authorization": f"Bearer {ACCESS_TOKEN}"}
@@ -212,7 +203,7 @@ def webhook():
     history = list(sess["history"])
     now = datetime.utcnow()
 
-    # Onboarding: ask for full name if not set
+    # Onboarding
     if user["name"] is None:
         text = msg.get("text", {}).get("body", "").strip()
         if text and len(text.split()) >= 2:
@@ -223,7 +214,7 @@ def webhook():
             send_text(phone, "Please share your full name (first and last).")
         return "OK", 200
 
-    # Credit reset & decrement for free users
+    # Credit reset & decrement
     if user["account_type"] == "free":
         rt = user["credit_reset"]
         if hasattr(rt, "to_datetime"):
@@ -238,7 +229,7 @@ def webhook():
             return "OK", 200
         update_user(phone, credit_remaining=user["credit_remaining"] - 1)
 
-    # Interactive buttons reply handling
+    # Interactive buttons reply
     if msg.get("type") == "interactive":
         ir = msg.get("interactive", {})
         if ir.get("type") == "button_reply":
@@ -252,7 +243,7 @@ def webhook():
                 send_buttons(phone)
         return "OK", 200
 
-    # Process message content
+    # Handle message content
     gemini_input = ""
     text = msg.get("text", {}).get("body", "").strip()
 
@@ -266,6 +257,8 @@ def webhook():
             image_bytes = download_media(media_url)
             extracted_text = analyze_image_with_vision(image_bytes)
             if extracted_text:
+                # Clean up newlines/spaces for prompt
+                extracted_text = "\n".join(line.strip() for line in extracted_text.splitlines() if line.strip())
                 gemini_input = f"I received this text from an image you sent:\n{extracted_text}"
             else:
                 gemini_input = "I received an image but couldn't extract readable text. Please describe it."
@@ -288,48 +281,43 @@ def webhook():
             gemini_input = "Sorry, I had trouble processing your audio. Please try again."
 
     else:
-        # Unsupported message type - ignore silently
+        # Unsupported type
         return "OK", 200
 
-    # Append input to session history
+    # Append to history
     sess["history"].append(gemini_input)
 
+    def clean_text(t):
+        # Remove empty lines and strip spaces, unify newlines
+        return '\n'.join(line.strip() for line in t.splitlines() if line.strip())
+
+    gemini_input_clean = clean_text(gemini_input)
+
     user_first_name = user["name"].split()[0] if user["name"] else None
-    prompt = build_prompt(user, history, gemini_input, user_first_name)
+    prompt = build_prompt(user, history, gemini_input_clean, user_first_name)
 
     raw_response = get_gemini(prompt)
     logger.info(f"Gemini raw response:\n{raw_response}")
 
-    # Clean code fences or markdown from response
     clean_response = strip_fences(raw_response)
 
-    # Parse Gemini JSON response to get type & content
     try:
         response_json = json.loads(clean_response)
         rtype = response_json.get("type", "answer")
         content = response_json.get("content", "")
     except Exception:
-        # If JSON parse fails, fallback to plain text answer
         rtype = "answer"
         content = clean_response
 
-    # Ensure content is string for WhatsApp text sending
-    if not isinstance(content, str):
-        content = str(content)
-
-    # Replace any escaped newlines to real newlines for WhatsApp formatting
-    content = content.replace("\\n", "\n")
+    content = clean_text(content)
 
     send_text(phone, content)
 
-    # If answer contains academic keywords, add buttons for feedback
     academic_keywords = ["step-by-step", "essay", "project", "exam", "solution", "problem", "question"]
     if rtype == "answer" and any(k in content.lower() for k in academic_keywords):
         send_buttons(phone)
 
-    # Update user's last prompt for potential 'explain more' follow-up
     update_user(phone, last_prompt=prompt)
-
     return "OK", 200
 
 
