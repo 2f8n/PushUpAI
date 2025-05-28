@@ -13,30 +13,33 @@ import google.generativeai as genai
 from google.cloud import vision
 from google.cloud import speech_v1p1beta1 as speech
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s — %(message)s")
+# Set up logging
+tb = logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s — %(message)s")
 logger = logging.getLogger("StudyMate")
 
-# Load environment variables\VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
+# Load environment variables
+VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
 ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 PORT = int(os.getenv("PORT", 10000))
 
-# Ensure all required env vars are set
 if not all([VERIFY_TOKEN, ACCESS_TOKEN, PHONE_NUMBER_ID, GEMINI_API_KEY]):
     logger.error("Missing required environment variables")
     raise SystemExit("Missing required environment variables")
 
-# Initialize services
+# Initialize Gemini
 genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel("gemini-1.5-pro-002")
 
+# Initialize Firebase
 cred = credentials.Certificate(
     "/etc/secrets/studymate-ai-9197f-firebase-adminsdk-fbsvc-5a52d9ff48.json"
 )
 firebase_admin.initialize_app(cred)
 db = firestore.client()
 
+# Initialize Vision and Speech clients
 vision_client = vision.ImageAnnotatorClient()
 speech_client = speech.SpeechClient()
 
@@ -45,24 +48,24 @@ with open("studymate_prompt.txt", "r") as f:
     SYSTEM_PROMPT = f.read().strip()
 
 app = Flask(__name__)
-sessions = {}  # phone number -> {'history': deque([...])}
+sessions = {}  # phone -> {"history": deque(maxlen=5)}
 
-# --- Helper Functions ---
+# --- Helpers ---
 def ensure_session(phone):
     return sessions.setdefault(phone, {"history": deque(maxlen=5)})
 
 def safe_post(url, payload):
     try:
-        resp = requests.post(
+        r = requests.post(
             url,
             headers={"Authorization": f"Bearer {ACCESS_TOKEN}", "Content-Type": "application/json"},
             json=payload,
         )
-        if resp.status_code not in (200, 201):
-            logger.error(f"WhatsApp API error {resp.status_code}: {resp.text}")
-        return resp
+        if r.status_code not in (200, 201):
+            logger.error(f"WhatsApp API error {r.status_code}: {r.text}")
+        return r
     except Exception:
-        logger.exception("Failed to send WhatsApp message")
+        logger.exception("Failed WhatsApp send")
         return None
 
 def send_text(phone, text):
@@ -89,6 +92,19 @@ def send_buttons(phone):
         },
     )
 
+def get_whatsapp_media_url(media_id):
+    url = f"https://graph.facebook.com/v19.0/{media_id}"
+    headers = {"Authorization": f"Bearer {ACCESS_TOKEN}"}
+    r = requests.get(url, headers=headers)
+    r.raise_for_status()
+    return r.json().get("url")
+
+def download_media(url):
+    headers = {"Authorization": f"Bearer {ACCESS_TOKEN}"}
+    r = requests.get(url, headers=headers)
+    r.raise_for_status()
+    return r.content
+
 def strip_fences_and_header(text):
     t = text.strip()
     if t.startswith("```"):
@@ -108,9 +124,9 @@ def get_gemini(prompt):
         return json.dumps({"type": "clarification", "content": "Sorry, an error occurred. Please try again."})
 
 def analyze_image_with_vision(image_bytes):
-    image = vision.Image(content=image_bytes)
-    response = vision_client.text_detection(image=image)
-    texts = response.text_annotations
+    img = vision.Image(content=image_bytes)
+    res = vision_client.text_detection(image=img)
+    texts = res.text_annotations
     return texts[0].description.strip() if texts else ""
 
 def transcribe_audio_with_speech(audio_bytes):
@@ -119,10 +135,10 @@ def transcribe_audio_with_speech(audio_bytes):
         encoding=speech.RecognitionConfig.AudioEncoding.OGG_OPUS,
         language_code="en-US",
         audio_channel_count=1,
-        enable_automatic_punctuation=True
+        enable_automatic_punctuation=True,
     )
-    resp = speech_client.recognize(config=config, audio=audio)
-    return "".join(r.alternatives[0].transcript for r in resp.results).strip()
+    response = speech_client.recognize(config=config, audio=audio)
+    return "".join(r.alternatives[0].transcript for r in response.results).strip()
 
 def get_or_create_user(phone):
     ref = db.collection("users").document(phone)
@@ -155,7 +171,7 @@ def build_prompt(user, history, message, first_name):
     parts.append("JSON:")
     return "\n".join(parts)
 
-# --- Webhook Endpoint ---
+# --- Webhook ---
 @app.route("/webhook", methods=["GET", "POST"])
 def webhook():
     if request.method == "GET":
@@ -164,11 +180,11 @@ def webhook():
         return "Verification failed", 403
 
     data = request.json or {}
-    entries = data.get("entry", [])
-    if not entries or not entries[0].get("changes"):
+    entry = data.get("entry", [])
+    if not entry or not entry[0].get("changes"):
         return "OK", 200
 
-    msg = entries[0]["changes"][0]["value"].get("messages", [{}])[0]
+    msg = entry[0]["changes"][0]["value"].get("messages", [{}])[0]
     phone = msg.get("from")
     if not phone:
         return "OK", 200
@@ -181,17 +197,17 @@ def webhook():
 
     # Onboarding
     if user.get("name") is None:
-        tb = msg.get("text", {}).get("body", "").strip()
-        if tb and len(tb.split()) >= 2:
-            update_user(phone, name=tb)
-            send_text(phone, f"What would you like to study today, {tb.split()[0]}?")
+        text_body = msg.get("text", {}).get("body", "").strip()
+        if text_body and len(text_body.split()) >= 2:
+            update_user(phone, name=text_body)
+            send_text(phone, f"What would you like to study today, {text_body.split()[0]}?")
         else:
             send_text(phone, "Please share your full name (first and last).")
         return "OK", 200
 
     # Greetings
-    text_body = msg.get("text", {}).get("body", "").strip().lower()
-    if text_body in ["hi", "hello", "hey", "are you there"]:
+    tb = msg.get("text", {}).get("body", "").strip().lower()
+    if tb in ["hi", "hello", "hey", "are you there"]:
         send_text(phone, f"Hi {first_name}! How can I help you study today?")
         return "OK", 200
 
@@ -208,7 +224,7 @@ def webhook():
             send_buttons(phone)
         return "OK", 200
 
-    # Credit handling
+    # Credit reset & decrement
     if user.get("account_type") == "free":
         rt = user.get("credit_reset")
         if hasattr(rt, "to_datetime"): rt = rt.to_datetime()
@@ -221,22 +237,18 @@ def webhook():
             return "OK", 200
         update_user(phone, credit_remaining=user.get("credit_remaining") - 1)
 
-    # Determine input type
+    # Determine input
     if "image" in msg:
         try:
-            mid = msg["image"]["id"]
-            url = f"https://graph.facebook.com/v19.0/{mid}"
-            meta = requests.get(url, headers={"Authorization": f"Bearer {ACCESS_TOKEN}"}).json()
-            img_bytes = requests.get(meta.get("url")).content
+            url = get_whatsapp_media_url(msg["image"]["id"])
+            img_bytes = download_media(url)
             gemini_input = analyze_image_with_vision(img_bytes)
         except:
             gemini_input = "I received an image but couldn’t extract text. Please describe it."
     elif "audio" in msg:
         try:
-            mid = msg["audio"]["id"]
-            url = f"https://graph.facebook.com/v19.0/{mid}"
-            meta = requests.get(url, headers={"Authorization": f"Bearer {ACCESS_TOKEN}"}).json()
-            audio_bytes = requests.get(meta.get("url")).content
+            url = get_whatsapp_media_url(msg["audio"]["id"])
+            audio_bytes = download_media(url)
             gemini_input = transcribe_audio_with_speech(audio_bytes)
         except:
             send_text(phone, f"No worries, {first_name}! What can I help you with next?")
@@ -244,7 +256,7 @@ def webhook():
     else:
         gemini_input = msg.get("text", {}).get("body", "").strip()
 
-    # Append history & build prompt
+    # Append history and prompt
     sess["history"].append(gemini_input)
     prompt = build_prompt(user, history, gemini_input, first_name)
 
@@ -261,12 +273,12 @@ def webhook():
         rtype, content = "answer", clean
 
     # Normalize newlines
-    content = content.replace("\\n", "\n").replace("/n/", "\n") if isinstance(content, str) else str(content)
+    content = content.replace("\\n", "\n").replace("/n/", "\n")
 
     send_text(phone, content)
 
     # Academic buttons
-    if rtype == "answer" and any(k in content.lower() for k in ["essay","problem","solution","question"]):
+    if rtype == "answer" and any(k in content.lower() for k in ["essay", "problem", "solution", "question"]):
         send_buttons(phone)
 
     update_user(phone, last_prompt=prompt)
