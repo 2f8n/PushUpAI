@@ -14,14 +14,12 @@ from google.cloud import speech
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s — %(message)s")
 logger = logging.getLogger("StudyMate")
 
-# Load .env if present
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
     pass
 
-# Environment variables check
 for v in ("VERIFY_TOKEN", "ACCESS_TOKEN", "PHONE_NUMBER_ID", "GEMINI_API_KEY"):
     if not os.getenv(v):
         logger.error(f"Missing environment variable: {v}")
@@ -33,25 +31,21 @@ PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 PORT = int(os.getenv("PORT", 10000))
 
-# Initialize Gemini AI
 genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel("gemini-1.5-pro-002")
 
-# Initialize Firebase (service account from mounted secret)
 firebase_secret_path = "/etc/secrets/studymate-ai-9197f-firebase-adminsdk-fbsvc-5a52d9ff48.json"
 cred = credentials.Certificate(firebase_secret_path)
 firebase_admin.initialize_app(cred)
 db = firestore.client()
 
-# Initialize Google Speech client
 speech_client = speech.SpeechClient()
 
-# Load system prompt
 with open("studymate_prompt.txt", "r") as f:
     SYSTEM_PROMPT = f.read().strip()
 
 app = Flask(__name__)
-sessions = {}  # phone -> {"history": deque(maxlen=5)}
+sessions = {}
 
 def ensure_session(phone):
     if phone not in sessions:
@@ -98,8 +92,8 @@ def send_buttons(phone):
 
 def strip_fences(t):
     t = t.strip()
-    if t.startswith("```"):
-        t = t.strip("`").strip()
+    if t.startswith("```") and t.endswith("```"):
+        t = t[3:-3].strip()
     return t
 
 def get_gemini(prompt):
@@ -109,6 +103,7 @@ def get_gemini(prompt):
         return response.text.strip()
     except Exception:
         logger.exception("Gemini error")
+        # Return valid JSON string so downstream doesn't break
         return json.dumps({"type": "clarification", "content": "Sorry, I encountered an error. Please try again."})
 
 def get_or_create_user(phone):
@@ -142,24 +137,24 @@ def build_prompt(user, history, message):
     parts.append("JSON:")
     return "\n".join(parts)
 
-def transcribe_audio_from_url(media_url):
+def download_media_url(media_url):
+    # Include Authorization header on media download - this is crucial for 401 errors!
     try:
-        # Download the audio file content
-        response = requests.get(media_url)
-        response.raise_for_status()
-        audio_content = response.content
+        r = requests.get(media_url, headers={"Authorization": f"Bearer {ACCESS_TOKEN}"})
+        r.raise_for_status()
+        return r.content
     except Exception as e:
         logger.error(f"Failed to download media: {e}")
         return None
 
-    audio = speech.RecognitionAudio(content=audio_content)
+def transcribe_audio(content_bytes):
+    audio = speech.RecognitionAudio(content=content_bytes)
     config = speech.RecognitionConfig(
         encoding=speech.RecognitionConfig.AudioEncoding.OGG_OPUS,
         sample_rate_hertz=16000,
         language_code="en-US",
         audio_channel_count=1,
     )
-
     try:
         response = speech_client.recognize(config=config, audio=audio)
         if response.results:
@@ -192,14 +187,13 @@ def webhook():
     msg_type = msg.get("type")
     text = ""
 
-    # Handle voice/audio message transcription
-    if msg_type == "audio" or msg_type == "voice":
+    if msg_type in ("audio", "voice"):
         media_id = msg.get(msg_type, {}).get("id")
         if not media_id:
             send_text(phone, "Sorry, I couldn't find the audio to process.")
             return "OK", 200
 
-        # Fetch media URL from WhatsApp
+        # Get media URL from WhatsApp API with authorization
         media_url_resp = requests.get(
             f"https://graph.facebook.com/v19.0/{media_id}",
             headers={"Authorization": f"Bearer {ACCESS_TOKEN}"},
@@ -213,7 +207,12 @@ def webhook():
             send_text(phone, "Sorry, I couldn't retrieve your audio URL. Please try again.")
             return "OK", 200
 
-        transcript = transcribe_audio_from_url(media_url)
+        audio_content = download_media_url(media_url)
+        if not audio_content:
+            send_text(phone, "Sorry, I couldn't download your audio. Please try again.")
+            return "OK", 200
+
+        transcript = transcribe_audio(audio_content)
         if not transcript:
             send_text(phone, "Sorry, I couldn't understand the audio. Please try again.")
             return "OK", 200
@@ -221,12 +220,10 @@ def webhook():
         text = transcript
         logger.info(f"User {phone} audio transcribed to: {text}")
 
-    # Handle text message
     elif msg_type == "text":
         text = msg.get("text", {}).get("body", "").strip()
-
     else:
-        # Ignore unsupported message types for now
+        # Ignore unsupported message types
         return "OK", 200
 
     if not text:
@@ -235,7 +232,6 @@ def webhook():
     user = get_or_create_user(phone)
     now = datetime.utcnow()
 
-    # Name onboarding
     if user["name"] is None:
         if len(text.split()) >= 2:
             first_name = text.split()[0]
@@ -245,7 +241,7 @@ def webhook():
             send_text(phone, "Please share your full name (first and last).")
         return "OK", 200
 
-    # Credits reset & check
+    # Reset credits daily
     if user["account_type"] == "free":
         rt = user["credit_reset"]
         if hasattr(rt, "to_datetime"):
@@ -260,7 +256,7 @@ def webhook():
             return "OK", 200
         update_user(phone, credit_remaining=user["credit_remaining"] - 1)
 
-    # Interactive replies (buttons)
+    # Handle interactive buttons replies
     if msg_type == "interactive":
         ir = msg.get("interactive", {})
         if ir.get("type") == "button_reply":
@@ -290,21 +286,19 @@ def webhook():
         rtype = "answer"
         content = clean
 
-    # Ensure content is string
     if not isinstance(content, str):
         content = str(content)
 
-    # **FIX: Send only content text (no raw JSON)**
+    # Send only content, never raw JSON
     send_text(phone, content)
 
-    # Send buttons ONLY if AI gave academic answer (type == "answer")
+    # Send buttons only on academic answer type
     if rtype == "answer":
         send_buttons(phone)
 
     update_user(phone, last_prompt=prompt)
 
     return "OK", 200
-
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=PORT)
